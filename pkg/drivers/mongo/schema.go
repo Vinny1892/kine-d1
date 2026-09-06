@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"github.com/sirupsen/logrus"
 )
 
 // Documento do log de revisões. É o equivalente BSON da tabela `kine` do
