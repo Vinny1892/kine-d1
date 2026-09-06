@@ -171,9 +171,19 @@ Contenção, buracos e ordem fora de sequência eram todos consequência do cont
 
 Sobra uma consequência a validar: **a revisão deixa de ser densa** — salta em vez de incrementar de 1. O apiserver trata `resourceVersion` como valor opaco monotônico, mas isso precisa ser confirmado com um k3s real (`MT-3`). Afeta também o `compactMinRetain`, que conta revisões e passará a ser uma janela de tempo.
 
-### 6.4 🟠 512 MB de storage
+### 6.4 🟠 512 MB de storage — medido
 
-A avaliação do D1 estimava 30-50 MB para um cluster médio, mas em SQLite. Documentos BSON com `_id`, índices e a cópia `old_value` ocupam mais. Precisa ser medido — e o M0 não tem auto-expand: ao encher, para.
+Um documento de 6 KB ocupa **13.694 bytes** com índices, então cabem **~39.200 revisões vivas** em 512 MB ([MSPIKE-9/5](spikes/results/mspike-5-9.md)). Para um cluster de 500 pods compactando a cada 5 min a 10 writes/s, estado corrente mais histórico ficam na casa de 3.500 documentos — dentro do teto com folga.
+
+**Mas o M0 não expande: ao encher, para.** Se a compactação atrasar, o cluster para junto. Isso faz do alerta de storage (`MOPS-1`) um requisito de lançamento — a mesma conclusão a que o D1 chegou sobre o alerta de custo, por outro caminho.
+
+### 6.4-b 🟠 O `LIST` é limitado por banda
+
+Medido: `LIST` de 300 chaves leva **823 ms com `value` e 54,6 ms sem** — 15× de diferença. Trocar o `$group` por uma coleção materializada não resolveu (1403 ms): o gargalo nunca foi o plano de execução, é o payload atravessando a rede, a ~5 MB/s.
+
+Isso explica retroativamente o D1, que media 1039 ms para as mesmas 300 chaves — **é característica de qualquer datastore remoto**, não do MongoDB.
+
+Consequência de projeto: **`keysOnly` deixa de ser otimização e vira caminho principal.** É o parâmetro que separa um LIST de 55 ms de um de 823 ms.
 
 ### 6.5 ✅ ~~Consistência~~ — RESOLVIDO de graça (MSPIKE-1)
 
