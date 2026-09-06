@@ -311,7 +311,13 @@ Via **Worker proxy** (Opção B) o problema some: 16 req/s = 41 mi requisições
 | SQLite local | < 1 ms |
 | etcd local | 1-10 ms |
 | PostgreSQL na mesma região | 5-20 ms |
-| **D1 via HTTPS (Brasil → primary nos EUA)** | **~150-350 ms** |
+| **D1 via HTTPS (Brasil → primary em ENAM)** | **304 ms medidos** (p95 395) |
+
+> ✅ **Medido no SPIKE-1** (2026-09-06, ver [`spikes/results/spike-1.md`](spikes/results/spike-1.md)): com keep-alive, `INSERT` p50 **304 ms** / p95 **395 ms**; `SELECT 1` p50 **274 ms**. Sem keep-alive, p50 sobe para 342 ms e o p95 para 611 ms.
+>
+> Dois detalhes que mudam a leitura do problema:
+> - O `meta.duration` do próprio D1 foi de **0,46 ms**. Ou seja, **99,8% do tempo é rede** — não é a query que é lenta, é a distância. Otimizar SQL não move esse número.
+> - Um `SELECT 1` custa 274 ms. **Toda** operação do apiserver paga ~260 ms de pedágio, faça ela o que fizer.
 
 Toda escrita vai ao *primary*, que é single-threaded. Consequências, em ordem de gravidade:
 
@@ -319,6 +325,8 @@ Toda escrita vai ao *primary*, que é single-threaded. Consequências, em ordem 
 2. **Watch com ~1 s de atraso** pelo ticker de polling — rollouts e readiness ficam visivelmente mais lentos.
 3. **`kubectl` lento** — cada `apply` paga ~300 ms extras; um `get pods` pode levar 0,5-1 s.
 4. **Throughput não é o problema.** Se o D1 sustenta ~50-200 writes/s por banco, os 3-10 writes/s do cluster médio cabem com folga de uma ordem de grandeza.
+5. **Keep-alive é requisito, não otimização.** O handshake TLS custa ~70 ms por requisição (SPIKE-1) — o pool de conexões do driver precisa reusar conexão desde o primeiro dia (DRV-2).
+6. **A latência não melhora com esforço nosso.** Os location hints do D1 não cobrem a América do Sul; ENAM é o mais próximo do Brasil. A confirmar no SPIKE-4.
 
 ### 6.7 Veredito
 
@@ -330,7 +338,7 @@ Traduzindo:
 |---|---|
 | ✅ **Capacidade** | Cabe com folga: 3% do armazenamento, 0,05% das leituras, ~100% das escritas incluídas |
 | ✅ **Custo** | ~$0-3/mês no plano Paid. Mais barato que qualquer Postgres gerenciado |
-| ⚠️ **Latência** | 150-350 ms por escrita. Cluster **funcional, porém lento**, com risco de flapping de leader election |
+| ⚠️ **Latência** | **304 ms medidos** por escrita (SPIKE-1). Cluster **funcional, porém lento**, com risco de flapping de leader election |
 | 🔴 **Rate limit** | Eliminatório se a API v4 se aplicar. Contornável com Worker proxy (Opção B) |
 | 🔴 **Transações** | Precisa da transação diferida com CAS (seção 5.1) — solucionável, mas é o maior trabalho de engenharia |
 

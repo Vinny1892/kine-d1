@@ -68,3 +68,9 @@ dist/
 
 # dapper binaries
 .dapper
+
+# kine-d1: credenciais e resultados locais dos spikes — nunca versionar
+.env
+*.env
+spikes/**/out/
+spikes/**/*.local.*
