@@ -109,7 +109,13 @@ Isso é atômico, mas cria três problemas que precisam de spike:
 2. **Buracos.** Se o `$inc` sucede e o insert do documento falha, a revisão foi consumida e some. É o que o gap-fill do kine trata (`Fill`/`IsFill`) — mas aqui o padrão de falha é diferente.
 3. **Visibilidade fora de ordem.** Duas escritas concorrentes podem obter as revisões 5 e 6 e o documento 6 ficar visível antes do 5. O `sqllog` já lidava com isso (`sql.go:530`), mas a lógica passa a ser nossa.
 
-> A alternativa é usar o **`clusterTime`/oplog do próprio MongoDB** como fonte de ordenação, em vez de um contador. Isso alinharia a revisão com o Change Stream naturalmente. É a decisão mais importante do projeto, e um spike dedicado.
+> ✅ **Resolvido pelo MSPIKE-4 — e a resposta foi abandonar o contador.**
+>
+> As três variantes com contador foram medidas sob concorrência 16. A correta (transação com retry) entrega **8,2 escritas/s** com p50 de 870 ms — abaixo do que um cluster de 20 nós precisa. E o problema decisivo é outro: com contador, **o Change Stream entrega as revisões fora de ordem** (13 de 29 eventos), porque a ordem do oplog é a de commit, não a de aquisição do contador.
+>
+> **A decisão é usar o `clusterTime` do MongoDB como revisão** ([ADR-0001](docs/adr/0001-revisao-por-clustertime.md)). Medido: conhecida na escrita via `session.operation_time`, única sob concorrência (40/40 distintas), e o Change Stream entrega **em ordem dela** — zero eventos fora de ordem. A escrita e o evento carregam o mesmo `clusterTime`.
+>
+> O contador inventa uma ordem que compete com a do banco; o `clusterTime` **é** a ordem do banco. Isso elimina de uma vez o contador, a contenção, as transações no caminho quente, o buffer de reordenação e o gap-fill.
 
 ---
 
@@ -119,6 +125,7 @@ Isso é atômico, mas cria três problemas que precisam de spike:
 |---|---|---|
 | **Storage** | **512 MB** | Teto real de tamanho de cluster |
 | **Throughput** | **100 ops/s** | Teto de carga — mas **throttle, não fatura** |
+| Documento (medido) | **16 MB** | vs 2 MiB por valor no D1 — deixa de ser risco |
 | Transferência | 10 GB in / 10 GB out por 7 dias | ~1,4 GB/dia; `LIST` grande pode apertar |
 | Conexões | 500 | Folgado |
 | Coleções | 500 | Usamos 2-3 |
@@ -158,17 +165,19 @@ Os dois pilares do desenho. Se qualquer um faltar no free tier, o projeto muda d
 
 Não há atalho: revisões, watch, compactação, gap-fill e lease. O `pkg/drivers/nats/` é o mapa mais próximo — vale lê-lo inteiro antes de escrever a primeira linha. O risco é subestimar a semântica sutil que o `sqllog` acumulou ao longo de anos de bugs corrigidos.
 
-### 6.3 🟠 Sequência de revisões
+### 6.3 ✅ ~~Sequência de revisões~~ — RESOLVIDO pelo MSPIKE-4
 
-Ver seção 4. Contenção, buracos e visibilidade fora de ordem. É onde um erro produz corrupção silenciosa do cluster, não uma exceção.
+Contenção, buracos e ordem fora de sequência eram todos consequência do contador. Com `clusterTime` ([ADR-0001](docs/adr/0001-revisao-por-clustertime.md)) os três desaparecem.
+
+Sobra uma consequência a validar: **a revisão deixa de ser densa** — salta em vez de incrementar de 1. O apiserver trata `resourceVersion` como valor opaco monotônico, mas isso precisa ser confirmado com um k3s real (`MT-3`). Afeta também o `compactMinRetain`, que conta revisões e passará a ser uma janela de tempo.
 
 ### 6.4 🟠 512 MB de storage
 
 A avaliação do D1 estimava 30-50 MB para um cluster médio, mas em SQLite. Documentos BSON com `_id`, índices e a cópia `old_value` ocupam mais. Precisa ser medido — e o M0 não tem auto-expand: ao encher, para.
 
-### 6.5 🟡 Consistência
+### 6.5 ✅ ~~Consistência~~ — RESOLVIDO de graça (MSPIKE-1)
 
-O kine precisa ler a revisão que acabou de gravar. Exige `writeConcern: majority` + `readConcern: majority` (ou `linearizable`), com custo de latência. Ler de secundário está fora de questão.
+`w=majority` custa **26,6 ms** contra 27,2 ms do write default — latência indistinguível. `readConcern: majority` custa 21,6 ms. O kine pode usar majority no caminho de escrita sem penalidade alguma.
 
 ### 6.6 🟡 Compactação e o oplog
 
