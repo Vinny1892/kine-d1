@@ -283,24 +283,41 @@ O que escreve no etcd/kine de forma **constante**, mesmo com o cluster parado:
 
 Sob operação normal (deploys, jobs, scaling), a média sobe para **~10 writes/s**, com picos de 30-50/s durante um rollout.
 
-### 6.2 Rows written — o detalhe que quase todo mundo esquece
+### 6.2 Rows written — corrigido pelo SPIKE-4
 
-O kine é um **log append-only**: cada mutação insere uma linha nova. E a compactação depois **apaga** essa linha (`CompactSQL`, `pkg/drivers/sqlite/sqlite.go:91`). No D1, `DELETE` também conta como `rows_written`. Portanto:
+> ⚠️ **A primeira versão desta seção errava por cerca de 70×.** O texto abaixo é o modelo medido.
 
-> **rows_written ≈ 2 × número de mutações**
+O kine é um **log append-only**: cada mutação insere uma linha, e a compactação depois a apaga (`CompactSQL`, `pkg/drivers/sqlite/sqlite.go:91`). No D1 o `DELETE` também conta como `rows_written`. Até aqui a estimativa dizia `rows_written ≈ 2 × mutações`.
 
-| Cenário | Writes/s | Rows written/dia | Rows written/mês | Custo D1 (Paid, 50 mi/mês incluídos) |
-|---|---|---|---|---|
-| Médio, ocioso | 3,3 | 570 mil | **17,1 mi** | **$0** — cabe no incluído (2,9× de folga) |
-| **Médio, operação normal** | **10** | **1,73 mi** | **52,6 mi** | **≈ $2,60/mês** (2,6 mi excedentes) |
-| Grande (50 nós / 2.500 pods) | 30 | 5,18 mi | 158 mi | ≈ $108/mês |
+**O que ela ignorava são os índices.** Medido ([`spikes/results/spike-4.md`](spikes/results/spike-4.md)):
+
+```
+INSERT com os 6 índices do kine ....... 8 rows_written
+INSERT em tabela sem índices .......... 1 rows_written
+DELETE ................................ 1 rows_written
+UPDATE ................................ 3 rows_written
+```
+
+Cada `INSERT` custa **8** linhas escritas — a linha, os 6 índices e o `sqlite_sequence` do AUTOINCREMENT. O D1 cobra por todas.
+
+> **rows_written ≈ 9 × mutações** (8 do insert + 1 do delete na compactação)
+
+| Cenário | Writes/s | Rows written/mês | Custo D1 (Paid, 50 mi/mês incluídos) |
+|---|---|---|---|
+| Médio, ocioso | 3,3 | 77,0 mi | **US$ 27/mês** |
+| **Médio, operação normal** | **10** | **233,3 mi** | **US$ 183/mês** |
+| Grande (50 nós / 2.500 pods) | 30 | 699,8 mi | US$ 650/mês |
+
+**A alavanca de otimização é o número de índices.** Sair de 6 para 3 levaria o insert de 8 para 5 `rows_written` — cerca de 37% de economia. O custo é `rows_read` maior nas queries que perderem índice, e leitura aqui é praticamente de graça (0,01% da franquia). Virou a task `KINE-9`.
 
 ### 6.3 Rows read — não é problema
 
 O laço de polling (`pkg/logstructured/sqllog/sql.go:486`) roda 1×/s. A query `After` usa `MAX(id)` sobre o rowid (O(1)), `MAX(prev_revision)` sobre o índice `kine_name_index`, e um range scan em `id > ?`. Ociosa, lê **~5 linhas por poll**:
 
-- 86.400 polls/dia × 5 = **432 mil rows read/dia** ≈ 13 mi/mês
-- Franquia incluída: **25 bilhões/mês** → estamos usando **0,05%**
+Medido no SPIKE-4: o poll ocioso lê **1 linha** e roda em 0,29 ms no servidor.
+
+- 86.400 polls/dia × 1 = **86,4 mil rows read/dia** ≈ 2,6 mi/mês
+- Franquia incluída: **25 bilhões/mês** → estamos usando **0,01%**
 
 Mesmo somando os `LIST` do apiserver (~1.500 linhas para listar 500 pods, e raros porque o watch cache absorve), rows read fica ordens de grandeza abaixo do incluído. **Custo de leitura ≈ $0.**
 
@@ -332,7 +349,18 @@ Contra os ~10 writes/s de um cluster médio, isso é **28× de folga**. Capacida
 | PostgreSQL na mesma região | 5-20 ms |
 | **D1 via HTTPS (Brasil → primary em ENAM)** | **304 ms medidos** (p95 395) |
 
-> ✅ **Medido no SPIKE-1** (2026-09-06, ver [`spikes/results/spike-1.md`](spikes/results/spike-1.md)): com keep-alive, `INSERT` p50 **304 ms** / p95 **395 ms**; `SELECT 1` p50 **274 ms**. Sem keep-alive, p50 sobe para 342 ms e o p95 para 611 ms.
+> ✅ **Medido** — SPIKE-1 (rede) e SPIKE-4 (queries reais do kine, 300 chaves, objetos de 6 KB):
+>
+> | Query | p50 | p95 | p99 |
+> |---|---|---|---|
+> | INSERT | 232 ms | 331 ms | 554 ms |
+> | Get de 1 chave | 210 ms | 223 ms | 229 ms |
+> | **List de prefixo (300 chaves)** | **1039 ms** | 1164 ms | 1164 ms |
+> | After — poll ocioso | 203 ms | 212 ms | 212 ms |
+>
+> **O `LIST` é o ponto fora da curva: 1 segundo para 300 chaves.** O apiserver faz `LIST` no startup de cada informer, então o boot do plano de controle paga esse pedágio várias vezes; com 500-1000 chaves vira 2-3 s por listagem. É o número que mais deve preocupar no `TEST-3`.
+>
+> Sem keep-alive o p50 sobe para 342 ms e o p95 para 611 ms.
 >
 > Dois detalhes que mudam a leitura do problema:
 > - O `meta.duration` do próprio D1 foi de **0,46 ms**. Ou seja, **99,8% do tempo é rede** — não é a query que é lenta, é a distância. Otimizar SQL não move esse número.
@@ -349,20 +377,22 @@ Toda escrita vai ao *primary*, que é single-threaded. Consequências, em ordem 
 
 ### 6.7 Veredito
 
-> **Sim, um cluster médio (10 nós / 500 pods) roda em D1 — e por menos de US$ 5/mês.** O limite não é capacidade nem custo; é latência e o rate limit da API.
+> **Sim, um cluster médio (10 nós / 500 pods) roda em D1 — por US$ 27 a 183/mês, e mais devagar do que você gostaria.** O limite não é capacidade; é latência e custo de escrita.
+
+> ⚠️ A primeira versão desta seção dizia "menos de US$ 5/mês". Estava errada por cerca de 70×: eu não contei que cada `INSERT` escreve também os 6 índices. Os números acima são medidos.
 
 Traduzindo:
 
 | | |
 |---|---|
 | ✅ **Capacidade** | Cabe com folga: 3% do armazenamento, 0,05% das leituras, ~100% das escritas incluídas |
-| ✅ **Custo** | ~$0-3/mês no plano Paid. Mais barato que qualquer Postgres gerenciado |
+| ⚠️ **Custo** | **US$ 27/mês ocioso, US$ 183/mês em operação** (SPIKE-4). Comparável a um Postgres gerenciado, não mais barato |
 | ⚠️ **Latência** | **304 ms medidos** por escrita (SPIKE-1). Cluster **funcional, porém lento**, com risco de flapping de leader election |
 | ✅ **Rate limit** | **Descartado** (SPIKE-2): 286 writes/s sem 429. Era o risco eliminatório |
 | ✅ **Throughput** | **28× de folga** para um cluster médio |
 | 🔴 **Transações** | Precisa da transação diferida com CAS (seção 5.1) — solucionável, mas é o maior trabalho de engenharia |
 
-**Onde faz sentido:** clusters de borda, homelab, dev/staging, control planes de baixa mutação, cenários onde "não administrar banco nenhum" e o Time Travel de 30 dias valem mais que os milissegundos.
+**Onde faz sentido:** clusters de borda, homelab, dev/staging, control planes de baixa mutação — cenários onde "não administrar banco nenhum" e o Time Travel de 30 dias valem mais que os milissegundos. Num cluster realmente ocioso o custo fica na faixa de US$ 27/mês, que é onde o argumento de operação zero se sustenta.
 
 **Onde não faz sentido:** produção crítica, clusters com muito churn (CI rodando milhares de Jobs), qualquer coisa com SLA agressivo de latência do apiserver. Para isso, etcd ou Postgres na mesma região.
 
@@ -442,6 +472,7 @@ Formato: `[ÉPICO] ID — título` · *estimativa* · **critério de aceite**.
 | KINE-6 | Mapear erro de unicidade → `server.ErrKeyExists` e `ErrCode` para métricas | M | Criar chave duplicada devolve o erro etcd correto |
 | KINE-7 | Defaults do pool de conexões e `FillRetryDuration` calibrados para HTTP | P | Sem thrashing de gap-fill sob carga |
 | KINE-8 | Intervalo de polling configurável por DSN | P | `?poll-interval=2s` reduz o número de requisições proporcionalmente |
+| KINE-9 | **Reduzir índices para cortar custo de escrita** | M | Insert cai de 8 para ≤5 `rows_written` sem regressão de latência. Cada INSERT escreve a linha + 6 índices + `sqlite_sequence` (SPIKE-4) — maior alavanca de custo, ~37% de economia |
 
 #### Épico D — Testes e conformidade
 
