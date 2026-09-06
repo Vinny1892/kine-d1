@@ -375,7 +375,35 @@ Toda escrita vai ao *primary*, que é single-threaded. Consequências, em ordem 
 5. **Keep-alive é requisito, não otimização.** O handshake TLS custa ~70 ms por requisição (SPIKE-1) — o pool de conexões do driver precisa reusar conexão desde o primeiro dia (DRV-2).
 6. **A latência não melhora com esforço nosso.** Os location hints do D1 não cobrem a América do Sul; ENAM é o mais próximo do Brasil. A confirmar no SPIKE-4.
 
-### 6.7 Veredito
+### 6.7 Teto de cluster e o custo do pior caso (SPIKE-9)
+
+> **US$ 22/mês por write/s sustentado.** É o único número que precisa ser lembrado. A franquia de 50 mi/mês cobre 2,30 writes/s. Detalhes em [`spikes/results/spike-9.md`](spikes/results/spike-9.md).
+
+**O control plane sozinho consome 87% da franquia gratuita**, antes de qualquer nó ou carga: a leader election de ~4 leases renova a cada 2 s, gerando 2,00 writes/s fixos. Cada nó adiciona 0,103 writes/s — **US$ 2,24/mês por nó**.
+
+| Nós (ocioso) | writes/s | US$/mês |
+|---|---|---|
+| 3 | 2,31 | **0** |
+| 10 | 3,03 | 16 |
+| 20 | 4,06 | 38 |
+| 50 | 7,15 | 105 |
+
+**Nós são baratos; atividade é cara.** Com US$ 50/mês você banca 25 nós ociosos, mas só **1,6 writes/s** de carga real.
+
+#### O pior caso — e a proteção acidental
+
+Um reconcile que sempre grava status dispara o próprio watch, que dispara outro reconcile. Descoberta contraintuitiva: **a lentidão do D1 limita o dano**. A 232 ms por write, cada worker em hot loop satura em 4,3 writes/s — num etcd local seriam milhares. A latência age como rate limiter, mas converte volume em dinheiro:
+
+| Workers em hot loop | writes/s | US$/mês |
+|---|---|---|
+| 1 | 4,3 | **44** |
+| 10 | 43,1 | **887** |
+
+E não precisa ser bug: um operador com `RequeueAfter: 10s` sobre 500 objetos — padrão que ninguém chamaria de abusivo — custa **US$ 1.037/mês**.
+
+**Não há freio automático.** O kine não tem rate limit e o D1 não tem hard cap configurável. Isso promove o alerta de `rows_written` (`OPS-1`) de "bom ter" a **requisito de lançamento**.
+
+### 6.8 Veredito
 
 > **Sim, um cluster médio (10 nós / 500 pods) roda em D1 — por US$ 27 a 183/mês, e mais devagar do que você gostaria.** O limite não é capacidade; é latência e custo de escrita.
 
@@ -396,7 +424,7 @@ Traduzindo:
 
 **Onde não faz sentido:** produção crítica, clusters com muito churn (CI rodando milhares de Jobs), qualquer coisa com SLA agressivo de latência do apiserver. Para isso, etcd ou Postgres na mesma região.
 
-**Limite prático estimado (revisto após o SPIKE-2):** o teto deixou de ser capacidade. Com 286 writes/s medidos, o que limita é o **custo de escrita**, que cresce linear (~$1 por milhão de linhas, e cada mutação custa 2), e a **latência**, que pressiona a leader election. Na prática: até ~50 nós e ~30 writes/s antes de o custo passar de US$ 100/mês e a latência virar o assunto dominante.
+**Limite prático (medido no SPIKE-9):** o teto não é capacidade nem latência — é **fatura**. A US$ 22/mês por write/s, a faixa em que o projeto se sustenta é **3 a 20 nós com carga previsível**, entre US$ 0 e 40/mês. Acima disso, ou com operadores de terceiros no cluster, o custo cresce sem aviso e sem freio.
 
 > ⚠️ Todos os números desta seção são **estimativas derivadas do código e da documentação**, não medições. Os spikes `SPIKE-2` (rate limit), `SPIKE-4` (latência) e a task `TEST-4` (carga) existem justamente para confirmá-los ou derrubá-los.
 

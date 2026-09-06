@@ -74,3 +74,4 @@ Para usar outro caminho, exporte `KINE_D1_ENV=/caminho/para/env`.
 | SPIKE-6 | `batch` atômico e o padrão CAS | ✅ [concluído](results/spike-6.md) — viável ([ADR-0002](../docs/adr/0002-transacao-diferida.md)) |
 | SPIKE-7 | Sessions API / bookmarks pela REST API | ✅ [concluído](results/spike-7.md) |
 | SPIKE-8 | Schema do kine no D1 e a constraint de unicidade | ✅ [concluído](results/spike-8.md) |
+| SPIKE-9 | **Teto de cluster e custo do pior caso** | ✅ [concluído](results/spike-9.md) — US$ 22/mês por write/s |
