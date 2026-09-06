@@ -214,17 +214,32 @@ Bate com o [changelog de 2025-05-30](https://developers.cloudflare.com/changelog
 
 Ressalva: medido de um único IP, numa janela de 88 s. Limites de longo prazo ou por múltiplas origens não seriam detectados assim — revalidar no `TEST-4`.
 
-### 5.3 🟠 Limite de 2 MB por linha vs. `value` + `old_value`
+### 5.3 🟢 Limite de tamanho — risco menor do que parecia (SPIKE-3)
 
-O k8s limita objetos a ~1,5 MB. A linha do kine guarda `value` **e** `old_value` (o valor anterior, para o `PrevKV` do watch). Dois objetos grandes na mesma linha estouram os 2 MB do D1. Se os `params` da API precisarem de base64 (ver 5.4), some +33%.
+A documentação da Cloudflare diz que "string, BLOB **ou linha**" têm teto de 2.000.000 bytes. **A parte da linha está errada.** Medido ([`spikes/results/spike-3.md`](spikes/results/spike-3.md)) — são dois limites distintos, ambos potências de 2:
 
-**Mitigações:** compressão (o driver `nats` já usa `klauspost/compress/s2` por motivo idêntico — ver `pkg/drivers/nats/codec.go:9`); e/ou mover `old_value` para uma tabela satélite. A compressão é a mitigação de menor atrito e resolve os dois problemas de uma vez (tamanho de linha e custo de armazenamento).
+| Limite | Valor real |
+|---|---|
+| Por valor individual | **2 MiB** (2.097.152) |
+| Por linha somada | **4 MiB** (4.194.304) |
 
-### 5.4 🟠 BLOBs sobre JSON
+Seis pontos de dados batem com esses valores sem exceção. O pior caso do kine — `value` e `old_value` cada um no teto de 1,5 MB do k8s, 3,0 MB de linha — foi testado direto e **passa, com 28% de folga**, com leitura de volta byte a byte idêntica.
 
-O corpo da REST API é JSON e o schema documenta `params` como array de strings. Os valores do kine são protobuf binário arbitrário. Não há como passar bytes crus.
+Sobra uma consequência: **isso condena o base64**. Com +33%, um objeto de 1,5 MB vira 2.048.000 bytes, a 2,3% do teto de 2 MiB. Funcionaria por 48 KB de margem — o que decidiu a escolha de codificação (ver 5.4).
 
-**Opções a testar no spike:** (a) coluna `value` como `TEXT` com base64 — simples, +33% de tamanho; (b) manter `BLOB` e usar `unhex(?)` no `INSERT` / `hex(value)` no `SELECT` — +100% no *transporte* mas mantém o BLOB no disco; (c) verificar se a API aceita array de inteiros como os bindings de Worker aceitam `ArrayBuffer`. A escolha muda o schema, então é bloqueante para o resto.
+A compressão (`DRV-6`) continua valendo, agora como folga extra e economia, não como salvação. Precedente no próprio kine: `pkg/drivers/nats/codec.go:9`.
+
+### 5.4 ✅ ~~BLOBs sobre JSON~~ — RESOLVIDO pelo SPIKE-3
+
+Quatro estratégias fazem round-trip byte a byte; a decisão está no [ADR-0001](docs/adr/0001-representacao-de-blob.md).
+
+**Escolhido: hex + `unhex()` → BLOB nativo**, com compressão por cima. Armazenamento 1:1 (contra 1,33× do base64) é o que preserva a margem de 28% no pior caso. O custo é 2× no transporte, mas em objetos k8s típicos de 5-10 KB a diferença medida foi ruído — 226 ms contra 225 ms.
+
+Duas armadilhas encontradas no caminho:
+- **`CAST(? AS BLOB)` não decodifica nada.** Produz `typeof = blob` mas guarda a string base64 inteira: o custo do base64 com a aparência de BLOB nativo. Difícil de pegar em revisão.
+- **String UTF-8 crua não é opção** — bytes arbitrários não são UTF-8 válido e falham já na codificação.
+
+Consequência de projeto: envolver `unhex()`/`hex()` **não** é transparente no nível de `database/sql`. Exige interceptação no dialeto D1 (`KINE-3`), não só no codec do driver (`DRV-5`).
 
 ### 5.5 🟠 Latência
 

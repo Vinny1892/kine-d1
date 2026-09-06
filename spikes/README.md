@@ -68,7 +68,7 @@ Para usar outro caminho, exporte `KINE_D1_ENV=/caminho/para/env`.
 |---|---|---|
 | SPIKE-1 | Banco provisionado e `/raw` acessível | ✅ [concluído](results/spike-1.md) |
 | SPIKE-2 | **Rate limit real de `/query` e `/raw`** — decide REST direta vs Worker proxy | ✅ [concluído](results/spike-2.md) — sem limite; Opção A confirmada |
-| SPIKE-3 | Representação de BLOB sobre JSON | a fazer |
+| SPIKE-3 | Representação de BLOB sobre JSON | ✅ [concluído](results/spike-3.md) — hex+unhex ([ADR-0001](../docs/adr/0001-representacao-de-blob.md)) |
 | SPIKE-4 | Latência p50/p95/p99 a partir do Brasil | a fazer |
 | SPIKE-5 | `meta.last_row_id`, `changes`, `RETURNING` | a fazer |
 | SPIKE-6 | `batch` atômico e o padrão CAS | a fazer |
