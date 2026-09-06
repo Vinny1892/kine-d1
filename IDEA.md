@@ -165,7 +165,9 @@ Como fazem os drivers `nats` e `t4`. Liberdade total, mas reimplementa revisões
 
 ### Recomendação
 
-**Começar pela A**, com o driver isolado atrás de uma interface `d1.Transport`, de modo que a **B** entre depois como uma implementação alternativa de transporte (`d1://...?proxy=https://meu-worker...`) sem reescrever o driver. A decisão A-vs-B depende inteiramente do resultado do spike de rate limit (task `SPIKE-2`).
+**Opção A**, confirmada pelo `SPIKE-2` — ver [`spikes/results/spike-2.md`](spikes/results/spike-2.md). O limite de 1.200/5min **não** se aplica aos endpoints de query do D1: 1.900 requisições em 88 s e 286 writes/s sustentados, sem um único 429.
+
+Ainda assim o driver fica isolado atrás de uma interface `d1.Transport`, para que a **B** possa entrar depois como transporte alternativo (`d1://...?proxy=https://meu-worker...`) sem reescrever nada. Mas ela deixou de ser contingência e virou otimização opcional, justificável só por batching e Sessions API.
 
 ### 4.1 Forma da DSN
 
@@ -202,11 +204,15 @@ O `sqllog` abre transações serializáveis em dois lugares (`sql.go:91` e `sql.
 
 Isso é **suficiente para o único uso real de transação no kine** (a compactação), mas é uma semântica mais fraca que `Serializable`. Precisa ser validado com o teste de compactação concorrente. Com `leaderElect = true` a janela de concorrência já é pequena, mas não nula (rolling upgrade do plano de controle).
 
-### 5.2 🔴 Rate limit da API v4
+### 5.2 ✅ ~~Rate limit da API v4~~ — RESOLVIDO pelo SPIKE-2
 
-A API v4 da Cloudflare tem limite global de **1.200 requisições por 5 minutos por usuário** (≈4 req/s), cumulativo entre dashboard, API key e token. O kine sozinho já faz **1 req/s de polling ocioso**, mais uma por escrita — e um cluster k3s ocioso escreve constantemente (renovação de `Lease` de nó a cada ~10s, `Endpoint`, eventos).
+Era o único risco com potencial de matar o projeto. **Não se confirmou.**
 
-Não está documentado se os endpoints `/query` e `/raw` do D1 caem nesse limite global — o [changelog de 2025-05-30](https://developers.cloudflare.com/changelog/2025-05-30-d1-rest-api-latency/) diz que eles passaram a ser servidos na borda, *bypassando os data centers centrais*, o que sugere um caminho diferente do plano de controle. **Isso precisa ser medido antes de qualquer linha de código de produção** — se o limite se aplicar, a Opção A morre e a B é obrigatória.
+A API v4 tem limite global de 1.200 req / 5 min por usuário (≈4 req/s), mas ele **não se aplica** a `/query` e `/raw` do D1. Medido em 2026-09-06 ([`spikes/results/spike-2.md`](spikes/results/spike-2.md)): **1.900 requisições em 88 s** (5,4× o limite, na mesma janela) e **286 writes/s sustentados**, sem nenhum 429 e sem nenhum erro.
+
+Bate com o [changelog de 2025-05-30](https://developers.cloudflare.com/changelog/2025-05-30-d1-rest-api-latency/): esses endpoints passaram a ser servidos na borda, fora dos data centers centrais que impõem o limite do plano de controle. O limite segue valendo para os endpoints de controle (criar/apagar banco), que o kine toca uma vez no setup.
+
+Ressalva: medido de um único IP, numa janela de 88 s. Limites de longo prazo ou por múltiplas origens não seriam detectados assim — revalidar no `TEST-4`.
 
 ### 5.3 🟠 Limite de 2 MB por linha vs. `value` + `old_value`
 
@@ -289,7 +295,7 @@ Mesmo somando os `LIST` do apiserver (~1.500 linhas para listar 500 pods, e raro
 
 Ressalva: o D1 não permite `VACUUM`. O SQLite reusa páginas livres depois dos `DELETE`, então o banco não cresce indefinidamente — mas o arquivo **nunca encolhe**. Um pico pontual (um Job criando 100 mil objetos) deixa o banco permanentemente grande. Com 10 GB de teto e 50 MB de uso normal isso é acadêmico, mas precisa entrar no monitoramento.
 
-### 6.5 O gargalo real nº 1 — requisições HTTP
+### 6.5 ~~O gargalo real nº 1~~ — requisições HTTP (resolvido)
 
 | Fonte | req/s |
 |---|---|
@@ -298,13 +304,11 @@ Ressalva: o D1 não permite `VACUUM`. O SQLite reusa páginas livres depois dos 
 | Leituras do apiserver | 1-5 |
 | **Total** | **≈ 6-16 req/s**, picos de 30-60 |
 
-E aqui está a condição eliminatória: a API v4 da Cloudflare limita a **1.200 requisições por 5 minutos = 4 req/s**. Se esse limite valer para `/query` e `/raw`, **o D1 via REST direta não sustenta nem um cluster de 3 nós** — vai ficar preso em 429 permanente.
+Essa era a condição eliminatória do projeto — o limite de 4 req/s da API v4 contra os 6-16 req/s necessários. **O SPIKE-2 derrubou a hipótese:** 40 req/s de leitura e 286 writes/s sustentados, sem nenhum 429.
 
-Via **Worker proxy** (Opção B) o problema some: 16 req/s = 41 mi requisições/mês × $0,30/mi ≈ **$12/mês**, sem teto rígido.
+Contra os ~10 writes/s de um cluster médio, isso é **28× de folga**. Capacidade de requisição deixou de ser um problema, e o Worker proxy deixou de ser necessário.
 
-**Por isso o `SPIKE-2` é o primeiro item do backlog.** Ele não decide se o projeto é viável — decide se a arquitetura é A ou B.
-
-### 6.6 O gargalo real nº 2 — latência (este não tem contorno)
+### 6.6 O gargalo real — latência (o único que sobrou, e não tem contorno)
 
 | Backend | Latência de escrita p50 |
 |---|---|
@@ -324,7 +328,7 @@ Toda escrita vai ao *primary*, que é single-threaded. Consequências, em ordem 
 1. **Flapping de leader election** — este é o modo de falha mais provável. Os controllers usam `RetryPeriod` de 2 s e `RenewDeadline` de 10 s. Com 300 ms está tudo bem; mas um pico de latência, um 429 ou uma degradação de rota faz o controller-manager e o scheduler **perderem a liderança e reiniciarem**. Precisa de tuning dos parâmetros de leader election e de alerta dedicado.
 2. **Watch com ~1 s de atraso** pelo ticker de polling — rollouts e readiness ficam visivelmente mais lentos.
 3. **`kubectl` lento** — cada `apply` paga ~300 ms extras; um `get pods` pode levar 0,5-1 s.
-4. **Throughput não é o problema.** Se o D1 sustenta ~50-200 writes/s por banco, os 3-10 writes/s do cluster médio cabem com folga de uma ordem de grandeza.
+4. **Throughput não é o problema — medido.** O D1 sustentou **286 writes/s** (SPIKE-2) contra os 3-10 writes/s de um cluster médio. E os 10.000 inserts concorrentes produziram IDs perfeitamente sequenciais, sem buraco nenhum: o gap-fill do kine deve disparar raramente.
 5. **Keep-alive é requisito, não otimização.** O handshake TLS custa ~70 ms por requisição (SPIKE-1) — o pool de conexões do driver precisa reusar conexão desde o primeiro dia (DRV-2).
 6. **A latência não melhora com esforço nosso.** Os location hints do D1 não cobrem a América do Sul; ENAM é o mais próximo do Brasil. A confirmar no SPIKE-4.
 
@@ -339,14 +343,15 @@ Traduzindo:
 | ✅ **Capacidade** | Cabe com folga: 3% do armazenamento, 0,05% das leituras, ~100% das escritas incluídas |
 | ✅ **Custo** | ~$0-3/mês no plano Paid. Mais barato que qualquer Postgres gerenciado |
 | ⚠️ **Latência** | **304 ms medidos** por escrita (SPIKE-1). Cluster **funcional, porém lento**, com risco de flapping de leader election |
-| 🔴 **Rate limit** | Eliminatório se a API v4 se aplicar. Contornável com Worker proxy (Opção B) |
+| ✅ **Rate limit** | **Descartado** (SPIKE-2): 286 writes/s sem 429. Era o risco eliminatório |
+| ✅ **Throughput** | **28× de folga** para um cluster médio |
 | 🔴 **Transações** | Precisa da transação diferida com CAS (seção 5.1) — solucionável, mas é o maior trabalho de engenharia |
 
 **Onde faz sentido:** clusters de borda, homelab, dev/staging, control planes de baixa mutação, cenários onde "não administrar banco nenhum" e o Time Travel de 30 dias valem mais que os milissegundos.
 
 **Onde não faz sentido:** produção crítica, clusters com muito churn (CI rodando milhares de Jobs), qualquer coisa com SLA agressivo de latência do apiserver. Para isso, etcd ou Postgres na mesma região.
 
-**Limite prático estimado:** até ~20-30 nós e ~15 writes/s sustentados. Acima disso o custo de escrita cresce linear e a latência começa a machucar o plano de controle.
+**Limite prático estimado (revisto após o SPIKE-2):** o teto deixou de ser capacidade. Com 286 writes/s medidos, o que limita é o **custo de escrita**, que cresce linear (~$1 por milhão de linhas, e cada mutação custa 2), e a **latência**, que pressiona a leader election. Na prática: até ~50 nós e ~30 writes/s antes de o custo passar de US$ 100/mês e a latência virar o assunto dominante.
 
 > ⚠️ Todos os números desta seção são **estimativas derivadas do código e da documentação**, não medições. Os spikes `SPIKE-2` (rate limit), `SPIKE-4` (latência) e a task `TEST-4` (carga) existem justamente para confirmá-los ou derrubá-los.
 
