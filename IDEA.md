@@ -192,17 +192,17 @@ Com suporte a variáveis de ambiente (`CLOUDFLARE_API_TOKEN`) para não colocar 
 
 Ordenados por gravidade. Cada um vira um *spike* na seção 6.
 
-### 5.1 🔴 Ausência de transações interativas
+### 5.1 ✅ ~~Ausência de transações interativas~~ — DESENHO VALIDADO pelo SPIKE-6
 
-O `sqllog` abre transações serializáveis em dois lugares (`sql.go:91` e `sql.go:234`) e faz **leituras e escritas intercaladas** dentro delas — o padrão do compact é: ler revisão atual → ler revisão compactada → comparar com o valor esperado → apagar linhas → gravar nova revisão compactada → commit. O D1 não suporta isso.
+O D1 rejeita `BEGIN TRANSACTION`/`SAVEPOINT`; só existe `batch`, atômico mas não interativo. O `sqllog` abre transações serializáveis em dois lugares (`sql.go:91` e `sql.go:234`) com leituras e escritas intercaladas.
 
-**Mitigação proposta:** implementar `server.Transaction` como *transação diferida com CAS*:
-- Leituras dentro da transação passam direto (autocommit) e retornam na hora.
-- Escritas são acumuladas num buffer.
-- No `Commit()`, o buffer é enviado como um `batch` atômico, precedido por um statement de *compare-and-swap* que falha se a `compact_rev_key` mudou desde a leitura — algo na linha de `UPDATE kine SET prev_revision = ? WHERE name = 'compact_rev_key' AND prev_revision = ?`, com verificação de `changes = 1` no `meta` da resposta.
-- `Rollback()` descarta o buffer.
+**Solução validada:** transação diferida com CAS — leituras em autocommit, escritas num buffer, `Commit()` envia um `batch` precedido de uma guarda que aborta se o estado mudou. Desenho completo no [ADR-0002](docs/adr/0002-transacao-diferida.md); medições em [`spikes/results/spike-6.md`](spikes/results/spike-6.md).
 
-Isso é **suficiente para o único uso real de transação no kine** (a compactação), mas é uma semântica mais fraca que `Serializable`. Precisa ser validado com o teste de compactação concorrente. Com `leaderElect = true` a janela de concorrência já é pequena, mas não nula (rolling upgrade do plano de controle).
+Os quatro critérios foram medidos contra um D1 real: batch atômico ✓ · guarda que aborta ✓ · compact protegido ✓ · duas instâncias concorrentes, exatamente uma vence ✓.
+
+**O achado que justifica o spike:** a mitigação que eu havia proposto — `UPDATE ... WHERE prev_revision = ?` com verificação de `changes` — é **silenciosamente errada**. Um `UPDATE` com CAS errado afeta 0 linhas e **retorna sucesso**; o `changes` só pode ser lido depois, quando o batch já apagou tudo. Medido: CAS correto passa, CAS errado também passa. A guarda correta usa uma tabela com `CHECK` constraint que gera erro de verdade e aborta o batch.
+
+Sobra uma consequência para o `KINE-6`: o erro de `CHECK` da instância perdedora precisa ser traduzido para `server.ErrCompacted`, que o `sqllog` já trata como situação normal. Sem isso, um cluster multi-servidor logaria erro a cada ciclo de compactação.
 
 ### 5.2 ✅ ~~Rate limit da API v4~~ — RESOLVIDO pelo SPIKE-2
 

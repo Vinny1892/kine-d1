@@ -71,6 +71,6 @@ Para usar outro caminho, exporte `KINE_D1_ENV=/caminho/para/env`.
 | SPIKE-3 | Representação de BLOB sobre JSON | ✅ [concluído](results/spike-3.md) — hex+unhex ([ADR-0001](../docs/adr/0001-representacao-de-blob.md)) |
 | SPIKE-4 | Latência p50/p95/p99 a partir do Brasil | a fazer |
 | SPIKE-5 | `meta.last_row_id`, `changes`, `RETURNING` | a fazer |
-| SPIKE-6 | `batch` atômico e o padrão CAS | a fazer |
+| SPIKE-6 | `batch` atômico e o padrão CAS | ✅ [concluído](results/spike-6.md) — viável ([ADR-0002](../docs/adr/0002-transacao-diferida.md)) |
 | SPIKE-7 | Sessions API / bookmarks pela REST API | a fazer |
 | SPIKE-8 | Schema do kine no D1 e a constraint de unicidade | a fazer |
