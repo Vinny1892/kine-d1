@@ -1,6 +1,6 @@
 # MT-3 — k3s real sobre o backend MongoDB
 
-**Status:** control plane validado · **Data:** 2026-09-07
+**Status:** ✅ **concluído** · **Data:** 2026-09-07
 
 ## Contexto
 
@@ -70,3 +70,72 @@ docker run -d --name k3s-mongo-mt3 --network kine-k3s-test-net --privileged \
   --disable traefik --disable servicelb --disable metrics-server --disable-cloud-controller
 docker exec k3s-mongo-mt3 kubectl get --raw=/readyz
 ```
+
+
+---
+
+# MT-3 concluído — k3s completo em EC2
+
+**Data:** 2026-09-07 · **Ambiente:** EC2 t3.small, Ubuntu 24.04, kernel 7.0.0-1012-aws, sa-east-1
+
+## Por que precisou sair do WSL
+
+As três tentativas no WSL2 travaram sempre no mesmo ponto, e a causa não era o backend:
+
+```
+81339  D  19:03  modprobe -- iptable_nat     <- travado no kernel
+88567  S   6:21  modprobe -- iptable_nat
+89687  S   2:16  modprobe -- iptable_nat
+```
+
+O primeiro `modprobe` ficou em estado **`D`** (uninterruptible sleep), travado dentro do kernel do WSL carregando `iptable_nat`. Processo em `D` não morre nem com `kill -9`, e o carregamento de módulos é serializado no kernel — então todo `modprobe` seguinte ficava preso atrás dele, e o k3s ficava em `do_wait` esperando o filho que nunca retornava. O containerd nunca subia, e o log parava em "Module br_netfilter was already loaded" sem erro.
+
+Durante todas essas tentativas o kine recebeu **duas** chamadas (`LIST /bootstrap`), respondeu `count=0` corretamente em milissegundos e ficou ocioso. O MongoDB nunca foi exercitado.
+
+Na EC2 o mesmo módulo carrega instantaneamente.
+
+## Resultado
+
+| Critério de aceite | Resultado |
+|---|---|
+| Nó `Ready` | ✅ **em ~4 s** |
+| `coredns` e `local-path-provisioner` | ✅ Running |
+| Deployment com pods reais (nginx) | ✅ 4/4 Running |
+| Scale 2 → 4 | ✅ |
+| Rolling update (alpine → 1.27-alpine) | ✅ |
+| `kubectl exec` | ✅ `nginx/1.27.5` |
+| `kubectl logs` | ✅ |
+| Leader election estável | ✅ holders inalterados |
+
+Leases adquiridas: `apiserver`, `k3s`, `k3s-cloud-controller-manager`, `kube-controller-manager`, `kube-scheduler`.
+
+## O backend sob um cluster de verdade
+
+```
+operações atendidas:   4.866 WATCH · 82 LIST · 4 DELETE
+erros no kine:         0
+memória da máquina:    847 MB de 1.906 MB (kine + k3s + containerd + pods)
+```
+
+**Zero erros.** O volume esmagadoramente de watch confirma o desenho: com Change Streams, o custo do watch é o stream único, não uma query por segundo por watcher.
+
+## Tamanho de um cluster k3s no MongoDB
+
+```
+842 documentos · 417 chaves distintas
+dataSize 1.729.056 bytes · storage + índices 1.052.672 bytes
+```
+
+| Prefixo | Chaves |
+|---|---|
+| `/registry/events` | 108 |
+| `/registry/clusterroles` | 74 |
+| `/registry/clusterrolebindings` | 57 |
+| `/registry/serviceaccounts` | 43 |
+| `/registry/apiregistration.k8s.io` | 23 |
+
+**Um cluster k3s inteiro ocupa ~1 MB.** Projetando os 512 MB do M0: **~429 mil documentos** — cerca de 500 clusters deste tamanho. O teto de storage, que era o gargalo mais provável, é muito mais folgado do que a estimativa do MSPIKE-7 sugeria (que usava objetos de 6 KB; os objetos reais do k3s são bem menores).
+
+## Reproduzir
+
+`hack/ec2-mt3.sh` provisiona, roda e destrói. Ver o script para a região usada.
