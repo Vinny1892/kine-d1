@@ -18,11 +18,11 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/k3s-io/kine/pkg/broadcaster"
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/ttl"
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -152,6 +152,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.mu.Unlock()
 
 	logrus.Infof("MongoDB iniciado: revisão atual=%d, revisão compactada=%d", rev, cr)
+	go ttl.Run(ctx, b)
 	return nil
 }
 
@@ -245,12 +246,4 @@ func (b *Backend) observeRevision(rev int64) {
 	}
 	b.mu.Unlock()
 	b.synced.Broadcast()
-}
-
-func (b *Backend) expiryFor(lease int64) *time.Time {
-	if lease <= 0 {
-		return nil
-	}
-	t := time.Now().Add(time.Duration(lease) * time.Second)
-	return &t
 }

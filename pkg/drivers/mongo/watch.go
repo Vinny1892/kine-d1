@@ -85,13 +85,21 @@ func (b *Backend) watchLoop(ctx context.Context, key, end string, revision int64
 	// 2) Stream ao vivo, retomado a partir do clusterTime correspondente à
 	//    última revisão já entregue — assim a emenda com o histórico não tem
 	//    buraco nem duplicata.
+	// Só inserts interessam. O kine é um log append-only: toda mutação — criar,
+	// atualizar, apagar — insere um documento novo. O único update que existe é
+	// o que grava o campo `rev` logo depois do insert (ver crud.go), e ele não
+	// representa mutação nenhuma.
+	//
+	// Escutar apenas inserts é o que torna a ordem correta de graça: a revisão
+	// É o clusterTime do insert, e o oplog entrega os eventos nessa ordem. Os
+	// updates, por serem uma segunda viagem de rede, podem chegar embaralhados
+	// entre escritas concorrentes — foi o que travou o apiserver em
+	// autoregister-completion.
 	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.M{
-			"operationType": bson.M{"$in": []string{"insert", "update", "replace"}},
-		}}},
+		{{Key: "$match", Value: bson.M{"operationType": "insert"}}},
 	}
 
-	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
+	opts := options.ChangeStream()
 	if corte > 0 {
 		ts := DecodeRevision(corte, b.cfg.EpochBase)
 		opts.SetStartAtOperationTime(&ts)
@@ -106,28 +114,39 @@ func (b *Backend) watchLoop(ctx context.Context, key, end string, revision int64
 
 	for cs.Next(ctx) {
 		var ev struct {
-			FullDocument *Record `bson:"fullDocument"`
+			ClusterTime  bson.Timestamp `bson:"clusterTime"`
+			FullDocument *Record        `bson:"fullDocument"`
 		}
 		if err := cs.Decode(&ev); err != nil {
 			logrus.Errorf("Falha ao decodificar evento do change stream: %v", err)
 			continue
 		}
 		r := ev.FullDocument
-		// Documentos ainda sem revisão são o intervalo entre o insert e o
-		// update que grava o `rev` (ver crud.go). O update subsequente gera
-		// outro evento, já com a revisão preenchida.
-		if r == nil || r.Rev == 0 {
+		if r == nil {
 			continue
 		}
-		if r.Rev <= corte {
+		// A revisão vem do clusterTime do evento, não do campo `rev` do
+		// documento. São o mesmo valor — o clusterTime do insert é o que a
+		// escrita gravou —, mas o do evento já está disponível aqui e chega na
+		// ordem do oplog, enquanto o campo depende de um update posterior.
+		rev, err := EncodeRevision(ev.ClusterTime, b.cfg.EpochBase)
+		if err != nil {
+			logrus.Errorf("clusterTime inválido no change stream: %v", err)
+			continue
+		}
+		r.Rev = rev
+		if r.Created {
+			r.CreateRevision = rev
+		}
+		if rev <= corte {
 			continue // já entregue na fase histórica
 		}
 		if !inRange(r.Name, key, end) {
-			b.observeRevision(r.Rev)
+			b.observeRevision(rev)
 			continue
 		}
-		corte = r.Rev
-		b.observeRevision(r.Rev)
+		corte = rev
+		b.observeRevision(rev)
 		eventos <- recordsToEvents([]*Record{r})
 	}
 

@@ -2,8 +2,8 @@ package mongo
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -29,7 +29,6 @@ type Record struct {
 	Lease          int64         `bson:"lease"`
 	Value          []byte        `bson:"value,omitempty"`
 	OldValue       []byte        `bson:"old_value,omitempty"`
-	ExpiresAt      *time.Time    `bson:"expires_at,omitempty"`
 }
 
 // metaDoc guarda o estado do cluster que precisa sobreviver a reinícios.
@@ -47,7 +46,7 @@ const (
 	idxRev          = "rev"
 	idxNamePrevUniq = "name_prev_uniq"
 	idxPrevRev      = "prev_revision"
-	idxLeaseTTL     = "lease_ttl"
+	legacyIdxTTL    = "lease_ttl"
 )
 
 // setup cria coleções e índices, e resolve o epoch base do cluster.
@@ -80,16 +79,21 @@ func (b *Backend) setup(ctx context.Context) error {
 			Keys:    bson.D{{Key: "prev_revision", Value: 1}},
 			Options: options.Index().SetName(idxPrevRev),
 		},
-		{
-			// Lease: o próprio MongoDB expira os documentos, dispensando a
-			// varredura que o pkg/ttl faz nos backends SQL.
-			Keys:    bson.D{{Key: "expires_at", Value: 1}},
-			Options: options.Index().SetName(idxLeaseTTL).SetExpireAfterSeconds(0),
-		},
 	}
 
 	if _, err := b.col.Indexes().CreateMany(ctx, idx); err != nil {
 		return fmt.Errorf("criar índices: %w", err)
+	}
+
+	// Versões iniciais do driver deixavam o MongoDB remover revisões por um
+	// índice TTL. Isso não gera a tombstone exigida pelo protocolo etcd e pode
+	// revelar uma versão histórica mais antiga da chave. A expiração agora é
+	// feita por pkg/ttl, que chama Delete com compare-and-swap.
+	if err := b.col.Indexes().DropOne(ctx, legacyIdxTTL); err != nil {
+		var serverErr mongo.ServerError
+		if !errors.As(err, &serverErr) || !serverErr.HasErrorCode(27) {
+			return fmt.Errorf("remover índice TTL legado: %w", err)
+		}
 	}
 
 	if err := b.resolveEpochBase(ctx); err != nil {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/server"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // Testes de integração contra um MongoDB real. Rodam apenas com a tag
@@ -270,6 +271,84 @@ func TestWatch(t *testing.T) {
 			t.Fatalf("timeout: recebeu %d de %d eventos", recebidos, n)
 		}
 	}
+}
+
+func TestWatchComEscritasConcorrentes(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	ctxW, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res := b.Watch(ctxW, "/wc/", "/wc0", 0)
+	time.Sleep(time.Second)
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := b.Create(ctx, fmt.Sprintf("/wc/%02d", i), []byte("v"), 0)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Create concorrente: %v", err)
+		}
+	}
+
+	vistos := 0
+	var ultima int64
+	for vistos < n {
+		select {
+		case lote, ok := <-res.Events:
+			if !ok {
+				t.Fatalf("canal fechado após %d eventos", vistos)
+			}
+			for _, e := range lote {
+				if e.KV.ModRevision <= ultima {
+					t.Fatalf("evento fora de ordem: %d depois de %d", e.KV.ModRevision, ultima)
+				}
+				ultima = e.KV.ModRevision
+				vistos++
+			}
+		case err := <-res.Errorc:
+			t.Fatalf("erro no watch: %v", err)
+		case <-ctxW.Done():
+			t.Fatalf("timeout: recebeu %d de %d eventos", vistos, n)
+		}
+	}
+}
+
+func TestLeaseExpiraComTombstone(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	chave := "/lease/curta"
+	if _, err := b.Create(ctx, chave, []byte("temporario"), 1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	prazo := time.Now().Add(10 * time.Second)
+	for time.Now().Before(prazo) {
+		_, kv, err := b.Get(ctx, chave, 0, false)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if kv == nil {
+			var tomb Record
+			if err := b.col.FindOne(ctx, bson.M{"name": chave, "deleted": true}).Decode(&tomb); err != nil {
+				t.Fatalf("a chave expirou sem tombstone: %v", err)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("a chave com lease não expirou")
 }
 
 func TestCompact(t *testing.T) {

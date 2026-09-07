@@ -9,7 +9,10 @@ def load():
     for line in open(ENV):
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1); cfg[k.strip()] = v.strip()
+            k, v = line.split("=", 1)
+            # o arquivo usa aspas simples porque a URI contém "&", que o
+            # shell interpretaria como operador ao dar source
+            cfg[k.strip()] = v.strip().strip("'\"")
     if not cfg.get("MONGO_URI"):
         sys.exit(f"MONGO_URI não definido em {ENV}")
     return cfg

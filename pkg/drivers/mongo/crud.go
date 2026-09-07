@@ -46,6 +46,11 @@ func (b *Backend) append(ctx context.Context, r *Record) (int64, error) {
 		return 0, err
 	}
 
+	// O update abaixo NÃO está no caminho crítico da ordenação: o watch deriva
+	// a revisão do clusterTime do evento de insert (ver watch.go), então esta
+	// segunda viagem pode acontecer em qualquer ordem entre escritas
+	// concorrentes. O campo `rev` serve às consultas históricas — After, List e
+	// Get por revisão —, que leem depois do fato.
 	set := bson.M{"rev": rev}
 	if r.Created {
 		// Numa criação a revisão de criação é a própria.
@@ -163,7 +168,6 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 		PrevRevision: prev,
 		Lease:        lease,
 		Value:        value,
-		ExpiresAt:    b.expiryFor(lease),
 	})
 	if mongo.IsDuplicateKeyError(err) {
 		return 0, server.ErrKeyExists
@@ -194,7 +198,6 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		Lease:          lease,
 		Value:          value,
 		OldValue:       cur.Value,
-		ExpiresAt:      b.expiryFor(lease),
 	}
 	newRev, err := b.append(ctx, novo)
 	if mongo.IsDuplicateKeyError(err) {
