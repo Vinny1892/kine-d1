@@ -16,6 +16,7 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Testes de integração contra um MongoDB real. Rodam apenas com a tag
@@ -577,6 +578,265 @@ func TestHistoricoPerdido(t *testing.T) {
 	for _, c := range casos {
 		if got := historicoPerdido(c.err); got != c.esperado {
 			t.Errorf("%s: historicoPerdido=%v, esperado %v", c.nome, got, c.esperado)
+		}
+	}
+}
+
+// TestInvalidacaoRealDoOplog fecha a lacuna que o TestRecuperacaoDeStreamInvalidado
+// deixava: aqui a invalidação é REAL, não simulada.
+//
+// Pedir um startAtOperationTime anterior à janela do oplog faz o MongoDB
+// recusar com ChangeStreamHistoryLost (286) — medido no MSPIKE-8, onde a janela
+// do M0 estava em 4,4 h. O que se prova é que o erro chega classificável pelo
+// historicoPerdido() e que abrirStream se recupera dele.
+func TestInvalidacaoRealDoOplog(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	if _, err := b.Create(ctx, "/inv/a", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 30 dias atrás cai fora de qualquer janela de oplog concebível.
+	antigo := bson.Timestamp{T: uint32(time.Now().Add(-30 * 24 * time.Hour).Unix()), I: 1}
+	cs, err := b.col.Watch(ctx, mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{"operationType": "insert"}}},
+	}, options.ChangeStream().SetStartAtOperationTime(&antigo))
+
+	// O erro pode vir na abertura ou na primeira leitura.
+	if err == nil {
+		cs.TryNext(ctx)
+		err = cs.Err()
+		cs.Close(context.Background())
+	}
+	if err == nil {
+		t.Skip("o MongoDB aceitou um startAtOperationTime de 30 dias atrás — " +
+			"a janela do oplog deve ter crescido; sem invalidação para observar")
+	}
+
+	t.Logf("erro devolvido: %v", err)
+	if !historicoPerdido(err) {
+		t.Errorf("historicoPerdido() não reconheceu a invalidação real — "+
+			"a recuperação do MW-3 não dispararia. erro: %v", err)
+	}
+
+	// E o driver precisa conseguir abrir um stream novo depois disso.
+	b.ctx = ctx
+	novo, err := b.abrirStream(nil)
+	if err != nil {
+		t.Fatalf("abrirStream após invalidação falhou: %v", err)
+	}
+	novo.Close(context.Background())
+}
+
+// TestCompactRepetido cobre a lacuna de o Compact nunca ter rodado por tempo
+// real: o apiserver compacta a cada 5 minutos, e se cada ciclo deixar lixo o
+// banco cresce sem limite — no M0, até parar o cluster.
+func TestCompactRepetido(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	const chaves, geracoes = 10, 6
+	revs := map[string]int64{}
+	for i := 0; i < chaves; i++ {
+		k := fmt.Sprintf("/c/%d", i)
+		r, err := b.Create(ctx, k, []byte("g0"), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		revs[k] = r
+	}
+
+	var docs []int64
+	for g := 1; g <= geracoes; g++ {
+		for i := 0; i < chaves; i++ {
+			k := fmt.Sprintf("/c/%d", i)
+			r, _, ok, err := b.Update(ctx, k, []byte(fmt.Sprintf("g%d", g)), revs[k], 0)
+			if err != nil || !ok {
+				t.Fatalf("Update g%d %s: err=%v ok=%v", g, k, err, ok)
+			}
+			revs[k] = r
+		}
+		atual, err := b.CurrentRevision(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Compact(ctx, atual); err != nil && err != server.ErrCompacted {
+			t.Fatalf("Compact na geração %d: %v", g, err)
+		}
+		n, err := b.col.CountDocuments(ctx, bson.M{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs = append(docs, n)
+		t.Logf("geração %d: %d documentos", g, n)
+	}
+
+	// O número de documentos precisa estabilizar: cada ciclo apaga o que o
+	// anterior tornou obsoleto. Se crescer sempre, o compact não está limpando.
+	primeiro, ultimo := docs[0], docs[len(docs)-1]
+	if ultimo > primeiro {
+		t.Errorf("o banco cresceu ao longo dos ciclos de compactação: %d -> %d "+
+			"(compact não está recuperando espaço)", primeiro, ultimo)
+	}
+	// E o estado corrente precisa continuar íntegro.
+	for i := 0; i < chaves; i++ {
+		k := fmt.Sprintf("/c/%d", i)
+		_, kv, err := b.Get(ctx, k, 0, false)
+		if err != nil {
+			t.Fatalf("Get %s: %v", k, err)
+		}
+		esperado := fmt.Sprintf("g%d", geracoes)
+		if kv == nil || string(kv.Value) != esperado {
+			t.Errorf("%s = %v, esperado %s", k, kv, esperado)
+		}
+	}
+}
+
+// testBackendNaColecao abre um backend adicional sobre a MESMA coleção, para
+// simular dois servidores kine compartilhando um MongoDB.
+func testBackendNaColecao(t *testing.T, db, col string) (*Backend, context.Context, func()) {
+	t.Helper()
+	uri := os.Getenv("KINE_MONGO_TEST_URI")
+	if uri == "" {
+		t.Skip("KINE_MONGO_TEST_URI não definida")
+	}
+	sep := "?"
+	if strings.Contains(uri, "?") {
+		sep = "&"
+	}
+	uri += fmt.Sprintf("%skine_database=%s&kine_collection=%s", sep, db, col)
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	_, b, err := New(ctx, wg, &drivers.Config{Endpoint: uri})
+	if err != nil {
+		cancel()
+		t.Fatalf("New: %v", err)
+	}
+	be := b.(*Backend)
+	if err := be.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("Start: %v", err)
+	}
+	return be, ctx, func() { cancel(); wg.Wait() }
+}
+
+// TestDuasInstancias cobre a promessa que o driver faz ao devolver
+// leaderElect=true: vários servidores kine sobre o mesmo MongoDB.
+//
+// A ordenação aqui não depende de coordenação entre processos — a revisão é o
+// clusterTime, que é global ao cluster MongoDB, e o oplog é único. Foi o que
+// permitiu remover os mutexes que a primeira correção do watch introduziu.
+func TestDuasInstancias(t *testing.T) {
+	db := "kine_multi"
+	col := fmt.Sprintf("m%d", time.Now().UnixNano())
+
+	a, ctxA, limparA := testBackendNaColecao(t, db, col)
+	defer limparA()
+	b2, ctxB, limparB := testBackendNaColecao(t, db, col)
+	defer limparB()
+	defer func() { _ = a.col.Drop(context.Background()); _ = a.meta.Drop(context.Background()) }()
+
+	// As duas instâncias precisam concordar no epoch base, senão as revisões
+	// de uma não fazem sentido para a outra.
+	if a.cfg.EpochBase != b2.cfg.EpochBase {
+		t.Fatalf("epoch base divergente: A=%d B=%d", a.cfg.EpochBase, b2.cfg.EpochBase)
+	}
+
+	// Um watch na instância A precisa ver o que a instância B escreve.
+	ctxW, cancel := context.WithTimeout(ctxA, 40*time.Second)
+	defer cancel()
+	res := a.Watch(ctxW, "/multi/", "/multi0", 0)
+	time.Sleep(3 * time.Second)
+
+	const n = 6
+	var revs []int64
+	for i := 0; i < n; i++ {
+		escritor, ctx := a, ctxA
+		if i%2 == 1 {
+			escritor, ctx = b2, ctxB
+		}
+		r, err := escritor.Create(ctx, fmt.Sprintf("/multi/%d", i), []byte("v"), 0)
+		if err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+		revs = append(revs, r)
+	}
+
+	// Revisões geradas por processos diferentes precisam ser globalmente
+	// monotônicas e distintas.
+	vistas := map[int64]bool{}
+	for i, r := range revs {
+		if vistas[r] {
+			t.Errorf("revisão %d repetida entre instâncias", r)
+		}
+		vistas[r] = true
+		if i > 0 && r <= revs[i-1] {
+			t.Errorf("revisões não monotônicas entre instâncias: %d após %d", r, revs[i-1])
+		}
+	}
+
+	recebidos, ultima := 0, int64(0)
+	prazo := time.After(35 * time.Second)
+	for recebidos < n {
+		select {
+		case lote, ok := <-res.Events:
+			if !ok {
+				t.Fatalf("canal fechou com %d de %d", recebidos, n)
+			}
+			for _, e := range lote {
+				if e.KV.ModRevision <= ultima {
+					t.Errorf("fora de ordem: %d após %d", e.KV.ModRevision, ultima)
+				}
+				ultima = e.KV.ModRevision
+				recebidos++
+			}
+		case err := <-res.Errorc:
+			t.Fatalf("watch: %v", err)
+		case <-prazo:
+			t.Fatalf("timeout: %d de %d eventos (a instância A não viu as escritas da B)", recebidos, n)
+		}
+	}
+
+	// Compactação concorrente: só uma pode avançar a revisão, sem corromper.
+	atual, err := a.CurrentRevision(ctxA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	erros := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); _, erros[0] = a.Compact(ctxA, atual) }()
+	go func() { defer wg.Done(); _, erros[1] = b2.Compact(ctxB, atual) }()
+	wg.Wait()
+
+	sucessos := 0
+	for _, e := range erros {
+		if e == nil {
+			sucessos++
+		} else if e != server.ErrCompacted {
+			t.Errorf("Compact concorrente devolveu erro inesperado: %v", e)
+		}
+	}
+	if sucessos != 1 {
+		t.Errorf("%d instâncias compactaram com sucesso, esperado exatamente 1", sucessos)
+	}
+
+	// O estado corrente precisa sobreviver, visto pelas duas.
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("/multi/%d", i)
+		for nome, inst := range map[string]*Backend{"A": a, "B": b2} {
+			ctx := ctxA
+			if nome == "B" {
+				ctx = ctxB
+			}
+			_, kv, err := inst.Get(ctx, k, 0, false)
+			if err != nil {
+				t.Fatalf("Get %s em %s: %v", k, nome, err)
+			}
+			if kv == nil {
+				t.Errorf("instância %s não vê %s após a compactação", nome, k)
+			}
 		}
 	}
 }

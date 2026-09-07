@@ -6,6 +6,19 @@ Kine is an etcdshim that translates etcd API to:
 - Postgres
 - MySQL/MariaDB
 - NATS
+- MongoDB
+
+
+## Backend MongoDB
+
+Este fork adiciona um backend **MongoDB** ao kine — ver [docs/mongodb.md](docs/mongodb.md).
+
+```bash
+kine --endpoint "mongodb+srv://usuario:senha@cluster.exemplo.mongodb.net/"
+```
+
+Requer MongoDB em replica set (o Atlas M0 free serve). Validado com k3s real;
+leia [Quando não usar](docs/mongodb.md#quando-não-usar) antes de levar a sério.
 
 ## Features
 - Can be ran standalone so any k8s (not just K3s) can use Kine
