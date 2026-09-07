@@ -11,20 +11,9 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 )
 
-// MT-1 — paridade com o backend de referência.
-//
-// O baseline não é o driver SQLite (cujos testes cobrem só VACUUM), é o
-// pkg/drivers/memory: 22 casos, e é o outro backend que implementa
-// server.Backend diretamente. Estes testes portam os casos que a suíte do
-// mongo ainda não cobria.
-//
-// Uma diferença estrutural exige adaptação: no memory as revisões são densas
-// (1, 2, 3), aqui vêm do clusterTime e saltam (ADR-0001). Onde o teste de
-// referência compara com um literal, aqui se compara com a revisão devolvida.
-
-func TestParidadeCreateAfterDelete(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityCreateAfterDelete(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 	k := "/test/a"
 
 	rev, err := b.Create(ctx, k, []byte("v1"), 0)
@@ -34,47 +23,45 @@ func TestParidadeCreateAfterDelete(t *testing.T) {
 	if _, _, ok, err := b.Delete(ctx, k, rev); err != nil || !ok {
 		t.Fatalf("Delete: err=%v ok=%v", err, ok)
 	}
-	// Recriar depois de apagar precisa funcionar, e a contagem de versões
-	// reinicia — é a semântica do etcd.
 	rev2, err := b.Create(ctx, k, []byte("v2"), 0)
 	if err != nil {
-		t.Fatalf("Create após Delete: %v", err)
+		t.Fatalf("Create after Delete: %v", err)
 	}
 	if rev2 <= rev {
-		t.Errorf("revisão não avançou: %d -> %d", rev, rev2)
+		t.Errorf("revision did not advance: %d -> %d", rev, rev2)
 	}
 	_, kv, err := b.Get(ctx, k, 0, false)
 	if err != nil || kv == nil {
 		t.Fatalf("Get: err=%v kv=%v", err, kv)
 	}
 	if string(kv.Value) != "v2" {
-		t.Errorf("valor = %q, esperado v2", kv.Value)
+		t.Errorf("value = %q, want v2", kv.Value)
 	}
 	if kv.Version != 1 {
-		t.Errorf("Version = %d após recriar, esperado 1", kv.Version)
+		t.Errorf("Version = %d after recriar, want 1", kv.Version)
 	}
 }
 
-func TestParidadeVersionIncrement(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityVersionIncrement(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 	k := "/test/a"
 
 	rev, err := b.Create(ctx, k, []byte("v1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for esperado, valor := range map[int64]string{1: "v1"} {
+	for want, payload := range map[int64]string{1: "v1"} {
 		_, kv, err := b.Get(ctx, k, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if kv.Version != esperado {
-			t.Errorf("Version = %d após criar, esperado %d", kv.Version, esperado)
+		if kv.Version != want {
+			t.Errorf("Version = %d after criar, want %d", kv.Version, want)
 		}
-		_ = valor
+		_ = payload
 	}
-	for i, esperado := range []int64{2, 3} {
+	for i, want := range []int64{2, 3} {
 		var err error
 		rev, _, _, err = b.Update(ctx, k, []byte(fmt.Sprintf("v%d", i+2)), rev, 0)
 		if err != nil {
@@ -84,15 +71,15 @@ func TestParidadeVersionIncrement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if kv.Version != esperado {
-			t.Errorf("Version = %d após %d updates, esperado %d", kv.Version, i+1, esperado)
+		if kv.Version != want {
+			t.Errorf("Version = %d after %d updates, want %d", kv.Version, i+1, want)
 		}
 	}
 }
 
-func TestParidadeWatchPrevKV(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityWatchPrevKV(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 	k := "/test/a"
 
 	rev, err := b.Create(ctx, k, []byte("v1"), 0)
@@ -112,32 +99,31 @@ func TestParidadeWatchPrevKV(t *testing.T) {
 	select {
 	case eventos := <-wr.Events:
 		if len(eventos) != 1 {
-			t.Fatalf("%d eventos, esperado 1", len(eventos))
+			t.Fatalf("%d events, want 1", len(eventos))
 		}
 		e := eventos[0]
 		if string(e.KV.Value) != "v2" {
-			t.Errorf("KV.Value = %q, esperado v2", e.KV.Value)
+			t.Errorf("KV.Value = %q, want v2", e.KV.Value)
 		}
 		if e.PrevKV == nil {
-			t.Fatal("PrevKV ausente — o watch não expôs o valor anterior")
+			t.Fatal("PrevKV missing - the watch did not expose the previous value")
 		}
 		if string(e.PrevKV.Value) != "v1" {
-			t.Errorf("PrevKV.Value = %q, esperado v1", e.PrevKV.Value)
+			t.Errorf("PrevKV.Value = %q, want v1", e.PrevKV.Value)
 		}
-		// revisões não são densas aqui: compara com a revisão da criação
 		if e.PrevKV.ModRevision != rev {
-			t.Errorf("PrevKV.ModRevision = %d, esperado %d", e.PrevKV.ModRevision, rev)
+			t.Errorf("PrevKV.ModRevision = %d, want %d", e.PrevKV.ModRevision, rev)
 		}
 	case err := <-wr.Errorc:
 		t.Fatalf("watch: %v", err)
 	case <-time.After(35 * time.Second):
-		t.Fatal("timeout esperando o evento")
+		t.Fatal("timeout waiting for o event")
 	}
 }
 
-func TestParidadeListExcludesDeleted(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityListExcludesDeleted(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 	pref, fim := "/test/", "/test0"
 
 	var revs []int64
@@ -157,11 +143,11 @@ func TestParidadeListExcludesDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(kvs) != 2 {
-		t.Fatalf("List devolveu %d, esperado 2 (a apagada não deve aparecer)", len(kvs))
+		t.Fatalf("List returned %d, want 2 (a deleted must not aparecer)", len(kvs))
 	}
 	for _, kv := range kvs {
 		if kv.Key == "/test/k1" {
-			t.Error("a chave apagada apareceu no List")
+			t.Error("a key deleted apareceu no List")
 		}
 	}
 	_, n, err := b.Count(ctx, pref, fim, 0)
@@ -169,13 +155,13 @@ func TestParidadeListExcludesDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 2 {
-		t.Errorf("Count = %d, esperado 2", n)
+		t.Errorf("Count = %d, want 2", n)
 	}
 }
 
-func TestParidadeGetAtRevision(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityGetAtRevision(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 	k := "/test/a"
 
 	r1, err := b.Create(ctx, k, []byte("v1"), 0)
@@ -191,31 +177,31 @@ func TestParidadeGetAtRevision(t *testing.T) {
 	}
 
 	for _, c := range []struct {
-		rev      int64
-		esperado string
+		rev  int64
+		want string
 	}{{r1, "v1"}, {r2, "v2"}, {0, "v3"}} {
 		_, kv, err := b.Get(ctx, k, c.rev, false)
 		if err != nil {
-			t.Fatalf("Get na revisão %d: %v", c.rev, err)
+			t.Fatalf("Get na revision %d: %v", c.rev, err)
 		}
-		if kv == nil || string(kv.Value) != c.esperado {
-			t.Errorf("Get(rev=%d) = %v, esperado %q", c.rev, kv, c.esperado)
+		if kv == nil || string(kv.Value) != c.want {
+			t.Errorf("Get(rev=%d) = %v, want %q", c.rev, kv, c.want)
 		}
 	}
 }
 
-func TestParidadeCompactDropsTombstones(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityCompactDropsTombstones(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
-	r, err := b.Create(ctx, "/test/morto", []byte("v"), 0)
+	r, err := b.Create(ctx, "/test/dead", []byte("v"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok, err := b.Delete(ctx, "/test/morto", r); err != nil || !ok {
+	if _, _, ok, err := b.Delete(ctx, "/test/dead", r); err != nil || !ok {
 		t.Fatalf("Delete: err=%v ok=%v", err, ok)
 	}
-	if _, err := b.Create(ctx, "/test/vivo", []byte("v"), 0); err != nil {
+	if _, err := b.Create(ctx, "/test/alive", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,26 +213,25 @@ func TestParidadeCompactDropsTombstones(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	// A tombstone precisa ter sumido, e a chave viva precisa continuar.
 	_, kvs, err := b.List(ctx, "/test/", "/test0", 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(kvs) != 1 || kvs[0].Key != "/test/vivo" {
-		t.Errorf("após compactar, List = %v, esperado só /test/vivo", kvs)
+	if len(kvs) != 1 || kvs[0].Key != "/test/alive" {
+		t.Errorf("after compaction, List = %v, want only /test/alive", kvs)
 	}
-	_, kv, err := b.Get(ctx, "/test/morto", 0, false)
+	_, kv, err := b.Get(ctx, "/test/dead", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if kv != nil {
-		t.Errorf("a chave apagada reapareceu após a compactação: %v", kv)
+		t.Errorf("the deleted key reappeared after compaction: %v", kv)
 	}
 }
 
-func TestParidadeWatchCompacted(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityWatchCompacted(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	r, err := b.Create(ctx, "/test/a", []byte("v1"), 0)
 	if err != nil {
@@ -266,24 +251,22 @@ func TestParidadeWatchCompacted(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	// Um watch a partir de revisão já compactada precisa devolver ErrCompacted,
-	// não silêncio — é como o apiserver sabe que precisa relistar.
 	wctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	wr := b.Watch(wctx, "/test/", "/test0", 1)
 	select {
 	case err := <-wr.Errorc:
 		if err != server.ErrCompacted {
-			t.Errorf("watch em revisão compactada devolveu %v, esperado ErrCompacted", err)
+			t.Errorf("watch em revision compacted returned %v, want ErrCompacted", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Error("watch em revisão compactada não devolveu erro algum")
+		t.Error("watch em revision compacted returned no erro algum")
 	}
 }
 
-func TestParidadeCurrentRevisionEDbSize(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityCurrentRevisionAndDbSize(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	r0, err := b.CurrentRevision(ctx)
 	if err != nil {
@@ -298,7 +281,7 @@ func TestParidadeCurrentRevisionEDbSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r2 < r1 || r2 <= r0 {
-		t.Errorf("CurrentRevision não acompanhou a escrita: %d -> %d (escrita em %d)", r0, r2, r1)
+		t.Errorf("CurrentRevision did not follow the write: %d -> %d (write at %d)", r0, r2, r1)
 	}
 
 	tam, err := b.DbSize(ctx)
@@ -306,15 +289,15 @@ func TestParidadeCurrentRevisionEDbSize(t *testing.T) {
 		t.Fatalf("DbSize: %v", err)
 	}
 	if tam <= 0 {
-		t.Errorf("DbSize = %d, esperado > 0", tam)
+		t.Errorf("DbSize = %d, want > 0", tam)
 	}
 }
 
-func TestParidadeKeysOnly(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestParityKeysOnly(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
-	if _, err := b.Create(ctx, "/test/a", []byte("conteudo"), 0); err != nil {
+	if _, err := b.Create(ctx, "/test/a", []byte("content"), 0); err != nil {
 		t.Fatal(err)
 	}
 	_, kv, err := b.Get(ctx, "/test/a", 0, true)
@@ -322,10 +305,10 @@ func TestParidadeKeysOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if kv == nil {
-		t.Fatal("Get keysOnly não devolveu a chave")
+		t.Fatal("Get keysOnly returned no a key")
 	}
 	if len(kv.Value) != 0 {
-		t.Errorf("Get keysOnly devolveu valor: %q", kv.Value)
+		t.Errorf("Get keysOnly returned value: %q", kv.Value)
 	}
 	if kv.Key != "/test/a" {
 		t.Errorf("Key = %q", kv.Key)

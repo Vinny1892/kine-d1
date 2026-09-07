@@ -15,18 +15,11 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Exercita o backend pelo protocolo etcd v3 real, do jeito que o kube-apiserver
-// faz. É a validação mais próxima do MT-3 que se consegue sem subir um k3s.
-//
-// O que importa aqui é o Txn com Compare(ModRevision): é assim que o apiserver
-// implementa concorrência otimista em toda escrita. Se isso não funcionar, nada
-// funciona — e é exatamente o ponto onde a decisão de derivar a revisão do
-// clusterTime (ADR-0001) poderia falhar, por não ser uma sequência densa.
 func etcdClient(t *testing.T) (*clientv3.Client, context.Context) {
 	t.Helper()
 	uri := os.Getenv("KINE_MONGO_TEST_URI")
 	if uri == "" {
-		t.Skip("KINE_MONGO_TEST_URI não definida")
+		t.Skip("KINE_MONGO_TEST_URI is not set")
 	}
 	sep := "?"
 	if strings.Contains(uri, "?") {
@@ -37,11 +30,9 @@ func etcdClient(t *testing.T) (*clientv3.Client, context.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
 	cfg := endpoint.Config{
-		Endpoint:  uri,
-		Listener:  fmt.Sprintf("unix://%s/kine-proto.sock", t.TempDir()),
-		WaitGroup: wg,
-		// Sem isso o kine faz rand.Int63n(0) em pkg/server/watch.go:35 e
-		// entra em panic ao abrir o primeiro watch.
+		Endpoint:       uri,
+		Listener:       fmt.Sprintf("unix://%s/kine-proto.sock", t.TempDir()),
+		WaitGroup:      wg,
 		NotifyInterval: 5 * time.Second,
 	}
 	e, err := endpoint.Listen(ctx, cfg)
@@ -73,9 +64,8 @@ func etcdClient(t *testing.T) (*clientv3.Client, context.Context) {
 	return cli, ctx
 }
 
-// TestTxnCriacao reproduz como o apiserver cria um objeto: um Txn que só grava
-// se a chave ainda não existir (ModRevision == 0).
-func TestTxnCriacao(t *testing.T) {
+// TestTxnCreate — see docs/implementation-notes.md
+func TestTxnCreate(t *testing.T) {
 	cli, ctx := etcdClient(t)
 	chave := "/registry/pods/default/nginx"
 
@@ -84,37 +74,34 @@ func TestTxnCriacao(t *testing.T) {
 		Then(clientv3.OpPut(chave, "objeto-v1")).
 		Commit()
 	if err != nil {
-		t.Fatalf("Txn de criação: %v", err)
+		t.Fatalf("create Txn: %v", err)
 	}
 	if !resp.Succeeded {
-		t.Fatal("Txn de criação não sucedeu com a chave inexistente")
+		t.Fatal("create Txn did not succeed on a missing key")
 	}
 
-	// A segunda criação precisa falhar — é assim que o apiserver detecta
-	// AlreadyExists.
 	resp2, err := cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.ModRevision(chave), "=", 0)).
 		Then(clientv3.OpPut(chave, "objeto-duplicado")).
 		Else(clientv3.OpGet(chave)).
 		Commit()
 	if err != nil {
-		t.Fatalf("Txn de criação duplicada: %v", err)
+		t.Fatalf("duplicate create Txn: %v", err)
 	}
 	if resp2.Succeeded {
-		t.Error("Txn de criação sucedeu numa chave que já existe")
+		t.Error("create Txn succeeded on an existing key")
 	}
 	if len(resp2.Responses) == 0 {
-		t.Fatal("o ramo Else não devolveu o valor atual")
+		t.Fatal("o ramo Else returned no o value atual")
 	}
 	rr := resp2.Responses[0].GetResponseRange()
 	if len(rr.Kvs) != 1 || string(rr.Kvs[0].Value) != "objeto-v1" {
-		t.Errorf("Else devolveu %v, esperado objeto-v1", rr.Kvs)
+		t.Errorf("Else returned %v, want objeto-v1", rr.Kvs)
 	}
 }
 
-// TestTxnAtualizacao reproduz o update do apiserver: grava só se a
-// ModRevision for exatamente a que ele leu.
-func TestTxnAtualizacao(t *testing.T) {
+// TestTxnUpdate — see docs/implementation-notes.md
+func TestTxnUpdate(t *testing.T) {
 	cli, ctx := etcdClient(t)
 	chave := "/registry/configmaps/default/cm"
 
@@ -136,27 +123,24 @@ func TestTxnAtualizacao(t *testing.T) {
 		t.Fatalf("Txn de update: %v", err)
 	}
 	if !resp.Succeeded {
-		t.Fatal("Txn de update falhou com a revisão correta — concorrência otimista quebrada")
+		t.Fatal("update Txn failed with the correct revision - optimistic concurrency is broken")
 	}
 
-	// Repetir com a revisão velha precisa falhar: é o Conflict do apiserver.
 	resp2, err := cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.ModRevision(chave), "=", rev)).
 		Then(clientv3.OpPut(chave, "v3")).
 		Else(clientv3.OpGet(chave)).
 		Commit()
 	if err != nil {
-		t.Fatalf("Txn com revisão velha: %v", err)
+		t.Fatalf("Txn com revision stale: %v", err)
 	}
 	if resp2.Succeeded {
-		t.Error("Txn sucedeu com revisão desatualizada — o apiserver perderia escritas")
+		t.Error("Txn sucedeu com revision stale — o apiserver perderia writes")
 	}
 }
 
-// TestRevisaoMonotonicaNoProtocolo é o teste que valida o ADR-0001 pelo
-// protocolo: as revisões que o apiserver enxerga precisam ser estritamente
-// crescentes. Elas NÃO são densas — saltam — e é isso que precisa ser tolerado.
-func TestRevisaoMonotonicaNoProtocolo(t *testing.T) {
+// TestRevisionMonotonicOverProtocol — see docs/implementation-notes.md
+func TestRevisionMonotonicOverProtocol(t *testing.T) {
 	cli, ctx := etcdClient(t)
 
 	var revs []int64
@@ -169,22 +153,21 @@ func TestRevisaoMonotonicaNoProtocolo(t *testing.T) {
 	}
 	for i := 1; i < len(revs); i++ {
 		if revs[i] <= revs[i-1] {
-			t.Fatalf("revisão não avançou: %d depois de %d", revs[i], revs[i-1])
+			t.Fatalf("revision did not advance: %d to de %d", revs[i], revs[i-1])
 		}
 	}
-	saltos := 0
+	jumps := 0
 	for i := 1; i < len(revs); i++ {
 		if revs[i] != revs[i-1]+1 {
-			saltos++
+			jumps++
 		}
 	}
-	t.Logf("revisões: %v", revs)
-	t.Logf("%d de %d incrementos não são densos (esperado com clusterTime)", saltos, len(revs)-1)
+	t.Logf("revisions: %v", revs)
+	t.Logf("%d de %d incrementos are not densos (want com clusterTime)", jumps, len(revs)-1)
 }
 
-// TestWatchProtocolo exercita o watch do jeito que o watch cache do apiserver
-// faz: a partir de uma revisão conhecida, esperando eventos em ordem.
-func TestWatchProtocolo(t *testing.T) {
+// TestWatchOverProtocol — see docs/implementation-notes.md
+func TestWatchOverProtocol(t *testing.T) {
 	cli, ctx := etcdClient(t)
 	pref := "/registry/pods/"
 
@@ -205,32 +188,32 @@ func TestWatchProtocolo(t *testing.T) {
 		}
 	}
 
-	vistos := 0
-	var ultima int64
-	for vistos < 3 {
+	seen := 0
+	var lastRev int64
+	for seen < 3 {
 		select {
 		case wr, ok := <-ch:
 			if !ok {
-				t.Fatalf("canal de watch fechou após %d eventos", vistos)
+				t.Fatalf("canal de watch fechou after %d events", seen)
 			}
 			if wr.Err() != nil {
 				t.Fatalf("watch: %v", wr.Err())
 			}
 			for _, ev := range wr.Events {
-				if ev.Kv.ModRevision <= ultima {
-					t.Errorf("evento fora de ordem: %d após %d", ev.Kv.ModRevision, ultima)
+				if ev.Kv.ModRevision <= lastRev {
+					t.Errorf("event out of order: %d after %d", ev.Kv.ModRevision, lastRev)
 				}
-				ultima = ev.Kv.ModRevision
-				vistos++
+				lastRev = ev.Kv.ModRevision
+				seen++
 			}
 		case <-time.After(25 * time.Second):
-			t.Fatalf("timeout: %d de 3 eventos", vistos)
+			t.Fatalf("timeout: %d de 3 events", seen)
 		}
 	}
 }
 
-// TestListPorPrefixo cobre o LIST que o apiserver faz no start de cada informer.
-func TestListPorPrefixo(t *testing.T) {
+// TestListByPrefix — see docs/implementation-notes.md
+func TestListByPrefix(t *testing.T) {
 	cli, ctx := etcdClient(t)
 	pref := "/registry/services/"
 
@@ -248,15 +231,15 @@ func TestListPorPrefixo(t *testing.T) {
 		t.Fatalf("Get com prefixo: %v", err)
 	}
 	if len(resp.Kvs) != 8 {
-		t.Fatalf("LIST devolveu %d chaves, esperado 8", len(resp.Kvs))
+		t.Fatalf("LIST returned %d keys, want 8", len(resp.Kvs))
 	}
 	for i := 1; i < len(resp.Kvs); i++ {
 		if string(resp.Kvs[i-1].Key) >= string(resp.Kvs[i].Key) {
-			t.Errorf("LIST fora de ordem: %s antes de %s", resp.Kvs[i-1].Key, resp.Kvs[i].Key)
+			t.Errorf("LIST out of order: %s before de %s", resp.Kvs[i-1].Key, resp.Kvs[i].Key)
 		}
 	}
 	if resp.Header.Revision == 0 {
-		t.Error("LIST não trouxe revisão no header — o watch cache depende dela")
+		t.Error("LIST returned no revision in the header - the watch cache depends on it")
 	}
 
 	cresp, err := cli.Get(ctx, pref, clientv3.WithPrefix(), clientv3.WithCountOnly())
@@ -264,6 +247,6 @@ func TestListPorPrefixo(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if cresp.Count != 8 {
-		t.Errorf("count=%d, esperado 8", cresp.Count)
+		t.Errorf("count=%d, want 8", cresp.Count)
 	}
 }

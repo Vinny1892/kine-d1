@@ -12,25 +12,14 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// append grava um registro no log e devolve a revisão atribuída.
-//
-// A revisão vem do clusterTime da própria escrita (session.OperationTime), que
-// só é conhecido DEPOIS do insert. Por isso são duas operações: o insert e um
-// update que grava o campo `rev`.
-//
-// Medido no MSPIKE-5: 30,7ms para o insert sozinho contra 59,5ms com o update.
-// Envolver as duas numa transação piora (80,9ms) sem ganho real — se o processo
-// morrer entre elas, o documento fica com rev=0 e é invisível para o watch e
-// para o List, que filtram por rev. Um documento órfão assim é inerte, não
-// corrompe nada, e a chave pode ser reescrita porque a constraint
-// (name, prev_revision) continua valendo.
+// append writes a record to the log and returns the assigned revision.
 func (b *Backend) append(ctx context.Context, r *Record) (rev int64, err error) {
-	inicio := time.Now()
-	defer func() { observar("append", inicio, err) }()
+	start := time.Now()
+	defer func() { observe("append", start, err) }()
 
 	sess, err := b.client.StartSession()
 	if err != nil {
-		return 0, fmt.Errorf("abrir sessão: %w", err)
+		return 0, fmt.Errorf("start session: %w", err)
 	}
 	defer sess.EndSession(ctx)
 
@@ -43,25 +32,19 @@ func (b *Backend) append(ctx context.Context, r *Record) (rev int64, err error) 
 
 	ts := sess.OperationTime()
 	if ts == nil {
-		return 0, fmt.Errorf("MongoDB não devolveu operationTime: impossível derivar a revisão")
+		return 0, fmt.Errorf("MongoDB returned no operationTime: cannot derive the revision")
 	}
 	rev, err = EncodeRevision(*ts, b.cfg.EpochBase)
 	if err != nil {
 		return 0, err
 	}
 
-	// O update abaixo NÃO está no caminho crítico da ordenação: o watch deriva
-	// a revisão do clusterTime do evento de insert (ver watch.go), então esta
-	// segunda viagem pode acontecer em qualquer ordem entre escritas
-	// concorrentes. O campo `rev` serve às consultas históricas — After, List e
-	// Get por revisão —, que leem depois do fato.
 	set := bson.M{"rev": rev}
 	if r.Created {
-		// Numa criação a revisão de criação é a própria.
 		set["create_revision"] = rev
 	}
 	if _, err := b.col.UpdateByID(sctx, res.InsertedID, bson.M{"$set": set}); err != nil {
-		return 0, fmt.Errorf("gravar revisão %d: %w", rev, err)
+		return 0, fmt.Errorf("write revision %d: %w", rev, err)
 	}
 
 	r.Rev = rev
@@ -69,7 +52,7 @@ func (b *Backend) append(ctx context.Context, r *Record) (rev int64, err error) 
 	return rev, nil
 }
 
-// currentRecord devolve o registro mais recente de uma chave.
+// currentRecord returns the most recent record for a key.
 func (b *Backend) currentRecord(ctx context.Context, key string) (*Record, error) {
 	var r Record
 	err := b.col.FindOne(ctx,
@@ -85,7 +68,7 @@ func (b *Backend) currentRecord(ctx context.Context, key string) (*Record, error
 	return &r, nil
 }
 
-// recordAt devolve o registro de uma chave como estava numa dada revisão.
+// recordAt returns a key's record as it stood at a given revision.
 func (b *Backend) recordAt(ctx context.Context, key string, revision int64) (*Record, error) {
 	if revision <= 0 {
 		return b.currentRecord(ctx, key)
@@ -118,7 +101,7 @@ func (r *Record) toKV() *server.KeyValue {
 	}
 }
 
-// Get devolve o valor de uma chave, opcionalmente numa revisão histórica.
+// Get returns a key's value, optionally at a historical revision.
 func (b *Backend) Get(ctx context.Context, key string, revision int64, keysOnly bool) (int64, *server.KeyValue, error) {
 	rev, err := b.CurrentRevision(ctx)
 	if err != nil {
@@ -148,11 +131,7 @@ func (b *Backend) Get(ctx context.Context, key string, revision int64, keysOnly 
 	return rev, kv, nil
 }
 
-// Create insere uma chave que ainda não existe.
-//
-// A exclusividade vem do índice único (name, prev_revision): uma criação usa
-// prev_revision=0, então duas criações concorrentes da mesma chave colidem e a
-// segunda recebe ErrKeyExists — o mesmo mecanismo do driver SQLite.
+// Create inserts a key that does not yet exist.
 func (b *Backend) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
 	existing, err := b.currentRecord(ctx, key)
 	if err != nil {
@@ -181,7 +160,7 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 	return rev, err
 }
 
-// Update substitui o valor de uma chave, se a revisão informada for a corrente.
+// Update replaces a key's value if the given revision is the current one.
 func (b *Backend) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *server.KeyValue, bool, error) {
 	cur, err := b.currentRecord(ctx, key)
 	if err != nil {
@@ -193,11 +172,10 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		return rev, nil, false, nil
 	}
 	if revision != 0 && cur.Rev != revision {
-		// Conflito de revisão: devolve o valor atual para o chamador comparar.
 		return rev, cur.toKV(), false, nil
 	}
 
-	novo := &Record{
+	updated := &Record{
 		Name:           key,
 		CreateRevision: cur.CreateRevision,
 		PrevRevision:   cur.Rev,
@@ -206,19 +184,18 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		OldValue:       cur.Value,
 		Version:        cur.Version + 1,
 	}
-	newRev, err := b.append(ctx, novo)
+	newRev, err := b.append(ctx, updated)
 	if mongo.IsDuplicateKeyError(err) {
-		// Outra escrita venceu a corrida por esta mesma revisão anterior.
 		return rev, cur.toKV(), false, nil
 	}
 	if err != nil {
 		return rev, nil, false, err
 	}
-	novo.CreateRevision = cur.CreateRevision
-	return newRev, novo.toKV(), true, nil
+	updated.CreateRevision = cur.CreateRevision
+	return newRev, updated.toKV(), true, nil
 }
 
-// Delete marca uma chave como apagada, gravando uma tombstone no log.
+// Delete marks a key as deleted by writing a tombstone to the log.
 func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64, *server.KeyValue, bool, error) {
 	cur, err := b.currentRecord(ctx, key)
 	if err != nil {

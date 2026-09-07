@@ -11,8 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// rangeFilter monta o filtro de chave. O etcd usa [key, end) para prefixos e
-// apenas key quando end é vazio.
+// rangeFilter builds the key filter.
 func rangeFilter(key, end string) bson.M {
 	if end == "" {
 		return bson.M{"name": key}
@@ -20,12 +19,7 @@ func rangeFilter(key, end string) bson.M {
 	return bson.M{"name": bson.M{"$gte": key, "$lt": end}}
 }
 
-// currentPipeline monta a agregação que devolve a revisão mais recente de cada
-// chave dentro de um range — o equivalente ao MAX(id) ... GROUP BY name do SQL.
-//
-// keysOnly não é cosmético aqui. Medido no MSPIKE-5: listar 300 chaves com
-// valor leva 823ms, sem valor leva 54,6ms. O gargalo é a transferência, não o
-// índice — projetar fora o `value` é o que separa os dois números.
+// currentPipeline builds the aggregation returning each key's latest revision.
 func currentPipeline(key, end string, revision, limit int64, includeDeleted, keysOnly bool) mongo.Pipeline {
 	match := rangeFilter(key, end)
 	match["rev"] = bson.M{"$gt": int64(0)}
@@ -55,14 +49,14 @@ func currentPipeline(key, end string, revision, limit int64, includeDeleted, key
 	return p
 }
 
-// List devolve o estado corrente das chaves de um range.
+// List returns the current state of the keys in a range.
 func (b *Backend) List(ctx context.Context, key, end string, limit, revision int64, keysOnly bool) (_ int64, _ []*server.KeyValue, err error) {
-	inicio := time.Now()
+	start := time.Now()
 	op := "list"
 	if keysOnly {
 		op = "list_keysonly"
 	}
-	defer func() { observar(op, inicio, err) }()
+	defer func() { observe(op, start, err) }()
 
 	rev, err := b.CurrentRevision(ctx)
 	if err != nil {
@@ -80,7 +74,7 @@ func (b *Backend) List(ctx context.Context, key, end string, limit, revision int
 
 	cur, err := b.col.Aggregate(ctx, currentPipeline(key, end, revision, limit, false, keysOnly))
 	if err != nil {
-		return rev, nil, fmt.Errorf("listar %q: %w", key, err)
+		return rev, nil, fmt.Errorf("list %q: %w", key, err)
 	}
 	defer cur.Close(ctx)
 
@@ -95,10 +89,10 @@ func (b *Backend) List(ctx context.Context, key, end string, limit, revision int
 	return rev, out, cur.Err()
 }
 
-// Count devolve quantas chaves existem no range.
+// Count returns how many keys exist in the range.
 func (b *Backend) Count(ctx context.Context, key, end string, revision int64) (_ int64, _ int64, err error) {
-	inicio := time.Now()
-	defer func() { observar("count", inicio, err) }()
+	start := time.Now()
+	defer func() { observe("count", start, err) }()
 
 	rev, err := b.CurrentRevision(ctx)
 	if err != nil {
@@ -126,8 +120,7 @@ func (b *Backend) Count(ctx context.Context, key, end string, revision int64) (_
 	return rev, res.N, nil
 }
 
-// after devolve os registros com revisão maior que a informada, em ordem.
-// É a base da recuperação histórica do watch.
+// after returns records with a revision greater than the given one, in order.
 func (b *Backend) after(ctx context.Context, key, end string, rev, limit int64) ([]*Record, error) {
 	filtro := bson.M{"rev": bson.M{"$gt": rev}}
 	if key != "" {

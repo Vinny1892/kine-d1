@@ -9,7 +9,8 @@ etcd.
 > [When not to use it](#when-not-to-use-it).
 
 **New here?** Start with the [k3s tutorial](k3s-tutorial.md). This page is the
-reference.
+reference; [implementation notes](implementation-notes.md) covers behaviour
+that is not obvious from the code.
 
 ---
 

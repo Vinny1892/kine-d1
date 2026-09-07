@@ -1,17 +1,4 @@
-// Package mongo implementa um backend MongoDB para o kine.
-//
-// Diferente dos drivers SQLite/PostgreSQL/MySQL, que compartilham o SQL de
-// pkg/drivers/generic através da interface server.Dialect, este driver
-// implementa server.Backend diretamente — como fazem os drivers nats e t4.
-// O motivo é estrutural: server.Dialect devolve *sql.Rows, e MongoDB não fala
-// SQL. Ver IDEA.md, seção 3.
-//
-// As duas decisões de projeto que moldam o resto do pacote:
-//
-//   - A revisão do etcd vem do clusterTime do MongoDB, não de um contador.
-//     Ver revision.go e docs/adr/0001-revisao-por-clustertime.md.
-//   - O watch usa Change Streams, dispensando o laço de polling que os
-//     backends SQL rodam uma vez por segundo.
+// Package mongo implements a MongoDB backend for kine.
 package mongo
 
 import (
@@ -36,33 +23,23 @@ import (
 // explicit interface check
 var _ server.Backend = (*Backend)(nil)
 
-// Backend implementa server.Backend sobre MongoDB.
+// Backend implements server.Backend on top of MongoDB.
 type Backend struct {
 	cfg    *Config
 	client *mongo.Client
 	col    *mongo.Collection
 	meta   *mongo.Collection
 
-	// currentRev é a última revisão conhecida. Mantida atualizada tanto pelas
-	// escritas locais quanto pelo Change Stream, que vê também as escritas de
-	// outras instâncias.
-	mu         sync.RWMutex
-	currentRev int64
-	compactRev int64
-	// ultimoEvento é quando o change stream entregou algo pela última vez.
-	// Alimenta o kine_mongo_change_stream_lag_seconds, que é a métrica que
-	// detecta o modo de falha mais provável: sob saturação o Atlas não devolve
-	// erro, só atrasa (MSPIKE-6).
+	mu           sync.RWMutex
+	currentRev   int64
+	compactRev   int64
 	ultimoEvento time.Time
 
-	// notify acorda quem espera por WaitForSyncTo.
 	synced *sync.Cond
 
 	broadcaster broadcaster.Broadcaster
 	ctx         context.Context
 
-	// streams conta quantos change streams este processo tem abertos. Só o
-	// MW-2 depende disso: o valor deve ser 1 por processo, não 1 por watcher.
 	streams atomic.Int64
 }
 
@@ -71,15 +48,11 @@ func init() {
 	drivers.Register("mongodb+srv", New)
 }
 
-// New constrói o backend. Devolve leaderElect=true porque o MongoDB é um
-// datastore compartilhado: todos os servidores do plano de controle enxergam o
-// mesmo estado, e só o líder deve compactar.
+// New builds the backend. It returns leaderElect=true because MongoDB is a
 func New(ctx context.Context, wg *sync.WaitGroup, drvCfg *drivers.Config) (bool, server.Backend, error) {
-	// O util.SchemeAndAddress do kine corta o scheme da DSN; aqui precisamos
-	// dele de volta, porque mongodb+srv:// muda a resolução de host.
 	dsn := drvCfg.Endpoint
 	if dsn == "" {
-		return false, nil, fmt.Errorf("endpoint vazio: informe uma connection string mongodb://")
+		return false, nil, fmt.Errorf("empty endpoint: provide a mongodb:// connection string")
 	}
 
 	cfg, err := ParseDSN(dsn)
@@ -87,9 +60,6 @@ func New(ctx context.Context, wg *sync.WaitGroup, drvCfg *drivers.Config) (bool,
 		return false, nil, err
 	}
 
-	// readConcern/writeConcern majority são obrigatórios: o kine precisa ler a
-	// revisão que acabou de gravar. Medido no MSPIKE-1 — majority custa 26,6ms
-	// contra 27,2ms do default, latência indistinguível.
 	opts := options.Client().
 		ApplyURI(cfg.URI).
 		SetWriteConcern(writeconcern.Majority()).
@@ -100,14 +70,14 @@ func New(ctx context.Context, wg *sync.WaitGroup, drvCfg *drivers.Config) (bool,
 
 	client, err := mongo.Connect(opts)
 	if err != nil {
-		return false, nil, fmt.Errorf("conectar ao MongoDB: %w", err)
+		return false, nil, fmt.Errorf("connect to MongoDB: %w", err)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, cfg.ServerSelectionTimeout)
 	defer cancel()
 	if err := client.Ping(pingCtx, nil); err != nil {
 		_ = client.Disconnect(context.Background())
-		return false, nil, fmt.Errorf("ping ao MongoDB: %w", err)
+		return false, nil, fmt.Errorf("ping MongoDB: %w", err)
 	}
 
 	db := client.Database(cfg.Database)
@@ -119,22 +89,22 @@ func New(ctx context.Context, wg *sync.WaitGroup, drvCfg *drivers.Config) (bool,
 	}
 	b.synced = sync.NewCond(b.mu.RLocker())
 
-	registrarMetricas(drvCfg.MetricsRegisterer)
+	registerMetrics(drvCfg.MetricsRegisterer)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
-		logrus.Info("Fechando conexão com o MongoDB…")
+		logrus.Info("Closing MongoDB connection…")
 		if err := client.Disconnect(context.Background()); err != nil {
-			logrus.Errorf("Falha ao desconectar do MongoDB: %v", err)
+			logrus.Errorf("Failed to disconnect from MongoDB: %v", err)
 		}
 	}()
 
 	return true, b, nil
 }
 
-// Start prepara o schema e carrega o estado inicial.
+// Start prepares the schema and loads the initial state.
 func (b *Backend) Start(ctx context.Context) error {
 	b.ctx = ctx
 
@@ -142,8 +112,6 @@ func (b *Backend) Start(ctx context.Context) error {
 		return err
 	}
 
-	// O kine espera que a chave compact_rev_key exista — é dela que os
-	// backends SQL leem a revisão compactada.
 	if err := b.ensureCompactKey(ctx); err != nil {
 		return err
 	}
@@ -164,19 +132,14 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.compactRev = cr
 	b.mu.Unlock()
 
-	logrus.Infof("MongoDB iniciado: revisão atual=%d, revisão compactada=%d", rev, cr)
+	logrus.Infof("MongoDB started: current revision=%d, compacted revision=%d", rev, cr)
 	go ttl.Run(ctx, b)
-	go b.coletarGauges(ctx)
+	go b.collectGauges(ctx)
 	return nil
 }
 
-// coletarGauges atualiza periodicamente as métricas que não vêm de operações:
-// revisões, uso de storage e atraso do change stream.
-//
-// O intervalo é longo de propósito. Um collStats a cada poucos segundos
-// consumiria parte do orçamento de operações do M0 — e o que se está medindo é
-// justamente a saturação desse orçamento.
-func (b *Backend) coletarGauges(ctx context.Context) {
+// collectGauges periodically refreshes the metrics not derived from operations.
+func (b *Backend) collectGauges(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
@@ -217,7 +180,7 @@ func (b *Backend) coletarGauges(ctx context.Context) {
 func (b *Backend) ensureCompactKey(ctx context.Context) error {
 	n, err := b.col.CountDocuments(ctx, bson.M{"name": compactRevKey})
 	if err != nil {
-		return fmt.Errorf("verificar compact_rev_key: %w", err)
+		return fmt.Errorf("check compact_rev_key: %w", err)
 	}
 	if n > 0 {
 		return nil
@@ -228,7 +191,7 @@ func (b *Backend) ensureCompactKey(ctx context.Context) error {
 		Value:   []byte(""),
 	})
 	if mongo.IsDuplicateKeyError(err) {
-		return nil // outra instância criou primeiro
+		return nil // another instance created it first
 	}
 	return err
 }
@@ -242,7 +205,7 @@ func (b *Backend) loadCurrentRevision(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("ler revisão atual: %w", err)
+		return 0, fmt.Errorf("read current revision: %w", err)
 	}
 	return r.Rev, nil
 }
@@ -254,12 +217,12 @@ func (b *Backend) loadCompactRevision(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("ler revisão compactada: %w", err)
+		return 0, fmt.Errorf("read compacted revision: %w", err)
 	}
 	return meta.CompactRevision, nil
 }
 
-// CurrentRevision devolve a última revisão conhecida.
+// CurrentRevision returns the latest known revision.
 func (b *Backend) CurrentRevision(ctx context.Context) (int64, error) {
 	b.mu.RLock()
 	rev := b.currentRev
@@ -270,9 +233,7 @@ func (b *Backend) CurrentRevision(ctx context.Context) (int64, error) {
 	return b.loadCurrentRevision(ctx)
 }
 
-// DbSize devolve o tamanho ocupado, somando dados e índices.
-//
-// Relevante no M0, cujo teto de 512 MB não expande: ao encher, o cluster para.
+// DbSize returns the space used, data plus indexes.
 func (b *Backend) DbSize(ctx context.Context) (int64, error) {
 	var stats struct {
 		StorageSize    int64 `bson:"storageSize"`
@@ -287,7 +248,7 @@ func (b *Backend) DbSize(ctx context.Context) (int64, error) {
 	return stats.StorageSize + stats.TotalIndexSize, nil
 }
 
-// WaitForSyncTo bloqueia até que a revisão informada tenha sido observada.
+// WaitForSyncTo blocks until the given revision has been observed.
 func (b *Backend) WaitForSyncTo(revision int64) {
 	b.mu.RLock()
 	for b.currentRev < revision {
@@ -296,10 +257,10 @@ func (b *Backend) WaitForSyncTo(revision int64) {
 	b.mu.RUnlock()
 }
 
-// streamsAbertos devolve quantos change streams este processo mantém.
-func (b *Backend) streamsAbertos() int64 { return b.streams.Load() }
+// openStreams reports how many change streams this process holds.
+func (b *Backend) openStreams() int64 { return b.streams.Load() }
 
-// observeRevision registra uma revisão vista e acorda quem espera por ela.
+// observeRevision records a seen revision and wakes up whoever waits for it.
 func (b *Backend) observeRevision(rev int64) {
 	b.mu.Lock()
 	if rev > b.currentRev {

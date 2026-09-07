@@ -26,6 +26,8 @@ streams and transactions need it; a standalone server will not do.
   taking this seriously
 - [Backup and restore](docs/backup-restore.md) — Atlas M0 has no automatic
   backups
+- [Implementation notes](docs/implementation-notes.md) — behaviour that is not
+  obvious from the code, and why
 
 Validated against a real k3s cluster: node `Ready`, deployment, scale, rolling
 update, `kubectl exec` and `logs`. Not for critical production — see the link

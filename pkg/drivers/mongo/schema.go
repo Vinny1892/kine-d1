@@ -11,13 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Documento do log de revisões. É o equivalente BSON da tabela `kine` do
-// driver SQLite (pkg/drivers/sqlite/sqlite.go:25).
-//
-// Diferença estrutural: em SQL a revisão é o `id` AUTOINCREMENT; aqui é o
-// campo Rev, derivado do clusterTime (ver revision.go). O `_id` continua sendo
-// o ObjectId natural do MongoDB, porque a revisão só é conhecida DEPOIS da
-// escrita e não pode servir de chave primária no momento do insert.
+// Record is one entry in the revision log — the BSON equivalent of the SQLite
 type Record struct {
 	ID             bson.ObjectID `bson:"_id,omitempty"`
 	Rev            int64         `bson:"rev"`
@@ -26,17 +20,13 @@ type Record struct {
 	Deleted        bool          `bson:"deleted"`
 	CreateRevision int64         `bson:"create_revision"`
 	PrevRevision   int64         `bson:"prev_revision"`
-	// Version conta as modificações desde a criação da chave: 1 na criação,
-	// 2 no primeiro update, e assim por diante. É a semântica do etcd, e o
-	// apiserver a expõe como metadata.generation em alguns objetos. Volta a 1
-	// quando a chave é recriada depois de apagada.
-	Version  int64  `bson:"version"`
-	Lease    int64  `bson:"lease"`
-	Value    []byte `bson:"value,omitempty"`
-	OldValue []byte `bson:"old_value,omitempty"`
+	Version        int64         `bson:"version"`
+	Lease          int64         `bson:"lease"`
+	Value          []byte        `bson:"value,omitempty"`
+	OldValue       []byte        `bson:"old_value,omitempty"`
 }
 
-// metaDoc guarda o estado do cluster que precisa sobreviver a reinícios.
+// metaDoc holds the cluster state that must survive restarts.
 type metaDoc struct {
 	ID              string `bson:"_id"`
 	EpochBase       int64  `bson:"epoch_base"`
@@ -54,50 +44,37 @@ const (
 	legacyIdxTTL    = "lease_ttl"
 )
 
-// setup cria coleções e índices, e resolve o epoch base do cluster.
-//
-// É idempotente: CreateIndexes ignora índices já existentes com a mesma
-// definição, e o documento de metadados é criado com upsert.
+// setup creates collections and indexes, and resolves the cluster epoch base.
 func (b *Backend) setup(ctx context.Context) error {
-	logrus.Info("Configurando coleções e índices do MongoDB…")
+	logrus.Info("Configuring MongoDB collections and indexes…")
 
 	idx := []mongo.IndexModel{
 		{
-			// Get da última revisão de uma chave, e o ListCurrent por prefixo.
 			Keys:    bson.D{{Key: "name", Value: 1}, {Key: "rev", Value: -1}},
 			Options: options.Index().SetName(idxNameRev),
 		},
 		{
-			// After — a query do watch e da recuperação histórica.
 			Keys:    bson.D{{Key: "rev", Value: 1}},
 			Options: options.Index().SetName(idxRev),
 		},
 		{
-			// É esta constraint que produz o ErrKeyExists do etcd quando dois
-			// clientes tentam criar a mesma chave. Espelha o índice
-			// kine_name_prev_revision_uindex do driver SQLite.
 			Keys:    bson.D{{Key: "name", Value: 1}, {Key: "prev_revision", Value: 1}},
 			Options: options.Index().SetName(idxNamePrevUniq).SetUnique(true),
 		},
 		{
-			// Compactação: encontra as revisões substituídas.
 			Keys:    bson.D{{Key: "prev_revision", Value: 1}},
 			Options: options.Index().SetName(idxPrevRev),
 		},
 	}
 
 	if _, err := b.col.Indexes().CreateMany(ctx, idx); err != nil {
-		return fmt.Errorf("criar índices: %w", err)
+		return fmt.Errorf("create indexes: %w", err)
 	}
 
-	// Versões iniciais do driver deixavam o MongoDB remover revisões por um
-	// índice TTL. Isso não gera a tombstone exigida pelo protocolo etcd e pode
-	// revelar uma versão histórica mais antiga da chave. A expiração agora é
-	// feita por pkg/ttl, que chama Delete com compare-and-swap.
 	if err := b.col.Indexes().DropOne(ctx, legacyIdxTTL); err != nil {
 		var serverErr mongo.ServerError
 		if !errors.As(err, &serverErr) || !serverErr.HasErrorCode(27) {
-			return fmt.Errorf("remover índice TTL legado: %w", err)
+			return fmt.Errorf("drop legacy TTL index: %w", err)
 		}
 	}
 
@@ -105,16 +82,12 @@ func (b *Backend) setup(ctx context.Context) error {
 		return err
 	}
 
-	logrus.Infof("MongoDB pronto: banco=%s coleção=%s epochBase=%d",
+	logrus.Infof("MongoDB ready: database=%s collection=%s epochBase=%d",
 		b.cfg.Database, b.cfg.Collection, b.cfg.EpochBase)
 	return nil
 }
 
-// resolveEpochBase lê o epoch base gravado ou grava o configurado.
-//
-// O valor NUNCA pode mudar depois de gravado: ele define o significado de toda
-// revisão já entregue ao apiserver. Se a DSN pedir um valor diferente do que
-// está no banco, isso é erro de configuração e não uma migração silenciosa.
+// resolveEpochBase reads the stored epoch base, or writes the configured one.
 func (b *Backend) resolveEpochBase(ctx context.Context) error {
 	var meta metaDoc
 	err := b.meta.FindOne(ctx, bson.M{"_id": metaID}).Decode(&meta)
@@ -122,8 +95,8 @@ func (b *Backend) resolveEpochBase(ctx context.Context) error {
 	case err == nil:
 		if b.cfg.EpochBase != defaultEpochBase && b.cfg.EpochBase != meta.EpochBase {
 			return fmt.Errorf(
-				"kine_epoch_base=%d conflita com o valor %d já gravado neste cluster: "+
-					"mudá-lo invalidaria todas as revisões existentes",
+				"kine_epoch_base=%d conflicts with the value %d already stored in this cluster: "+
+					"changing it would invalidate every existing revision",
 				b.cfg.EpochBase, meta.EpochBase)
 		}
 		b.cfg.EpochBase = meta.EpochBase
@@ -135,16 +108,15 @@ func (b *Backend) resolveEpochBase(ctx context.Context) error {
 			EpochBase: b.cfg.EpochBase,
 		})
 		if mongo.IsDuplicateKeyError(err) {
-			// Outra instância gravou primeiro — relê e adota o valor dela.
 			return b.resolveEpochBase(ctx)
 		}
 		if err != nil {
-			return fmt.Errorf("gravar metadados: %w", err)
+			return fmt.Errorf("write metadata: %w", err)
 		}
-		logrus.Infof("Epoch base do cluster definido em %d", b.cfg.EpochBase)
+		logrus.Infof("Cluster epoch base set to %d", b.cfg.EpochBase)
 		return nil
 
 	default:
-		return fmt.Errorf("ler metadados: %w", err)
+		return fmt.Errorf("read metadata: %w", err)
 	}
 }

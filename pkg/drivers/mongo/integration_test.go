@@ -22,17 +22,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Testes de integração contra um MongoDB real. Rodam apenas com a tag
-// `integration` e a variável KINE_MONGO_TEST_URI apontando para um cluster:
-//
-//	go test -tags=integration ./pkg/drivers/mongo/ -v
 func testBackend(t *testing.T) (*Backend, context.Context, func()) {
 	t.Helper()
 	uri := os.Getenv("KINE_MONGO_TEST_URI")
 	if uri == "" {
-		t.Skip("KINE_MONGO_TEST_URI não definida")
+		t.Skip("KINE_MONGO_TEST_URI is not set")
 	}
-	// Cada execução usa uma coleção própria, para não pisar nas outras.
 	sep := "?"
 	if strings.Contains(uri, "?") {
 		sep = "&"
@@ -59,35 +54,34 @@ func testBackend(t *testing.T) (*Backend, context.Context, func()) {
 	}
 }
 
-func TestCriarLerAtualizarApagar(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestCreateReadUpdateDelete(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	chave := "/registry/pods/default/nginx"
-	valor := []byte("primeiro")
+	payload := []byte("first")
 
-	rev, err := b.Create(ctx, chave, valor, 0)
+	rev, err := b.Create(ctx, chave, payload, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if rev == 0 {
-		t.Fatal("Create devolveu revisão zero")
+		t.Fatal("Create returned revision zero")
 	}
 
 	_, kv, err := b.Get(ctx, chave, 0, false)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if kv == nil || string(kv.Value) != "primeiro" {
-		t.Fatalf("Get devolveu %v, esperado 'primeiro'", kv)
+	if kv == nil || string(kv.Value) != "first" {
+		t.Fatalf("Get returned %v, want 'first'", kv)
 	}
 	if kv.ModRevision != rev {
-		t.Errorf("ModRevision=%d, esperado %d", kv.ModRevision, rev)
+		t.Errorf("ModRevision=%d, want %d", kv.ModRevision, rev)
 	}
 
-	// Criar de novo precisa falhar — é o ErrKeyExists do etcd.
 	if _, err := b.Create(ctx, chave, []byte("x"), 0); err != server.ErrKeyExists {
-		t.Errorf("Create duplicado devolveu %v, esperado ErrKeyExists", err)
+		t.Errorf("Create duplicado returned %v, want ErrKeyExists", err)
 	}
 
 	rev2, kv2, ok, err := b.Update(ctx, chave, []byte("segundo"), rev, 0)
@@ -95,19 +89,18 @@ func TestCriarLerAtualizarApagar(t *testing.T) {
 		t.Fatalf("Update: err=%v ok=%v", err, ok)
 	}
 	if rev2 <= rev {
-		t.Errorf("revisão não avançou: %d -> %d", rev, rev2)
+		t.Errorf("revision did not advance: %d -> %d", rev, rev2)
 	}
 	if string(kv2.Value) != "segundo" {
-		t.Errorf("Update devolveu %q", kv2.Value)
+		t.Errorf("Update returned %q", kv2.Value)
 	}
 
-	// A revisão histórica precisa continuar visível.
 	_, antigo, err := b.Get(ctx, chave, rev, false)
 	if err != nil {
-		t.Fatalf("Get histórico: %v", err)
+		t.Fatalf("historical Get: %v", err)
 	}
-	if antigo == nil || string(antigo.Value) != "primeiro" {
-		t.Errorf("Get na revisão %d devolveu %v, esperado 'primeiro'", rev, antigo)
+	if antigo == nil || string(antigo.Value) != "first" {
+		t.Errorf("Get na revision %d returned %v, want 'first'", rev, antigo)
 	}
 
 	_, _, ok, err = b.Delete(ctx, chave, rev2)
@@ -116,16 +109,16 @@ func TestCriarLerAtualizarApagar(t *testing.T) {
 	}
 	_, kv3, err := b.Get(ctx, chave, 0, false)
 	if err != nil {
-		t.Fatalf("Get após delete: %v", err)
+		t.Fatalf("Get after delete: %v", err)
 	}
 	if kv3 != nil {
-		t.Errorf("chave ainda visível após delete: %v", kv3)
+		t.Errorf("key still visible after delete: %v", kv3)
 	}
 }
 
-func TestListEContagem(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestListAndCount(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	for i := 0; i < 10; i++ {
 		k := fmt.Sprintf("/registry/pods/default/p%02d", i)
@@ -133,7 +126,6 @@ func TestListEContagem(t *testing.T) {
 			t.Fatalf("Create %s: %v", k, err)
 		}
 	}
-	// Uma chave fora do prefixo, para provar que o range é respeitado.
 	if _, err := b.Create(ctx, "/registry/services/x", []byte("fora"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -145,11 +137,11 @@ func TestListEContagem(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	if len(kvs) != 10 {
-		t.Fatalf("List devolveu %d chaves, esperado 10", len(kvs))
+		t.Fatalf("List returned %d keys, want 10", len(kvs))
 	}
 	for i := 1; i < len(kvs); i++ {
 		if kvs[i-1].Key >= kvs[i].Key {
-			t.Errorf("List fora de ordem: %q antes de %q", kvs[i-1].Key, kvs[i].Key)
+			t.Errorf("List out of order: %q before de %q", kvs[i-1].Key, kvs[i].Key)
 		}
 	}
 
@@ -158,7 +150,7 @@ func TestListEContagem(t *testing.T) {
 		t.Fatalf("Count: %v", err)
 	}
 	if n != 10 {
-		t.Errorf("Count=%d, esperado 10", n)
+		t.Errorf("Count=%d, want 10", n)
 	}
 
 	_, lim, err := b.List(ctx, pref, fim, 3, 0, false)
@@ -166,25 +158,24 @@ func TestListEContagem(t *testing.T) {
 		t.Fatalf("List com limite: %v", err)
 	}
 	if len(lim) != 3 {
-		t.Errorf("List com limite devolveu %d, esperado 3", len(lim))
+		t.Errorf("List com limite returned %d, want 3", len(lim))
 	}
 
-	// keysOnly é o que separa 55ms de 823ms num range grande (MSPIKE-5).
 	_, so, err := b.List(ctx, pref, fim, 0, 0, true)
 	if err != nil {
 		t.Fatalf("List keysOnly: %v", err)
 	}
 	for _, kv := range so {
 		if len(kv.Value) != 0 {
-			t.Errorf("keysOnly devolveu valor em %q", kv.Key)
+			t.Errorf("keysOnly returned value em %q", kv.Key)
 			break
 		}
 	}
 }
 
-func TestRevisoesMonotonicas(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestRevisionsAreMonotonic(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	const n = 20
 	revs := make([]int64, 0, n)
@@ -197,14 +188,14 @@ func TestRevisoesMonotonicas(t *testing.T) {
 	}
 	for i := 1; i < len(revs); i++ {
 		if revs[i] <= revs[i-1] {
-			t.Errorf("revisões não são monotônicas: %d depois de %d", revs[i], revs[i-1])
+			t.Errorf("revisions are not monotonic: %d after %d", revs[i], revs[i-1])
 		}
 	}
 }
 
-func TestRevisoesConcorrentes(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestConcurrentRevisions(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	const n = 24
 	var wg sync.WaitGroup
@@ -222,29 +213,29 @@ func TestRevisoesConcorrentes(t *testing.T) {
 	vistas := map[int64]bool{}
 	for i, err := range errs {
 		if err != nil {
-			t.Errorf("Create concorrente %d: %v", i, err)
+			t.Errorf("Create concurrent %d: %v", i, err)
 			continue
 		}
 		if vistas[revs[i]] {
-			t.Errorf("revisão duplicada: %d", revs[i])
+			t.Errorf("revision duplicate: %d", revs[i])
 		}
 		vistas[revs[i]] = true
 	}
 	if len(vistas) != n {
-		t.Errorf("%d revisões distintas, esperado %d", len(vistas), n)
+		t.Errorf("%d revisions distintas, want %d", len(vistas), n)
 	}
 }
 
 func TestWatch(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	ctxW, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	res := b.Watch(ctxW, "/w/", "/w0", 0)
 	if res.Events == nil {
-		t.Fatal("Watch não devolveu canal de eventos")
+		t.Fatal("Watch returned no canal de events")
 	}
 	time.Sleep(2 * time.Second) // deixa o change stream assentar
 
@@ -255,33 +246,33 @@ func TestWatch(t *testing.T) {
 		}
 	}
 
-	recebidos := 0
-	var ultima int64
-	prazo := time.After(25 * time.Second)
-	for recebidos < n {
+	received := 0
+	var lastRev int64
+	deadline := time.After(25 * time.Second)
+	for received < n {
 		select {
 		case lote, ok := <-res.Events:
 			if !ok {
-				t.Fatalf("canal fechado após %d eventos", recebidos)
+				t.Fatalf("canal fechado after %d events", received)
 			}
 			for _, e := range lote {
-				if e.KV.ModRevision <= ultima {
-					t.Errorf("evento fora de ordem: %d depois de %d", e.KV.ModRevision, ultima)
+				if e.KV.ModRevision <= lastRev {
+					t.Errorf("event out of order: %d to de %d", e.KV.ModRevision, lastRev)
 				}
-				ultima = e.KV.ModRevision
-				recebidos++
+				lastRev = e.KV.ModRevision
+				received++
 			}
 		case err := <-res.Errorc:
 			t.Fatalf("erro no watch: %v", err)
-		case <-prazo:
-			t.Fatalf("timeout: recebeu %d de %d eventos", recebidos, n)
+		case <-deadline:
+			t.Fatalf("timeout: recebeu %d de %d events", received, n)
 		}
 	}
 }
 
-func TestWatchComEscritasConcorrentes(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestWatchWithConcurrentWrites(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	ctxW, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -303,44 +294,44 @@ func TestWatchComEscritasConcorrentes(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		if err != nil {
-			t.Fatalf("Create concorrente: %v", err)
+			t.Fatalf("Create concurrent: %v", err)
 		}
 	}
 
-	vistos := 0
-	var ultima int64
-	for vistos < n {
+	seen := 0
+	var lastRev int64
+	for seen < n {
 		select {
 		case lote, ok := <-res.Events:
 			if !ok {
-				t.Fatalf("canal fechado após %d eventos", vistos)
+				t.Fatalf("canal fechado after %d events", seen)
 			}
 			for _, e := range lote {
-				if e.KV.ModRevision <= ultima {
-					t.Fatalf("evento fora de ordem: %d depois de %d", e.KV.ModRevision, ultima)
+				if e.KV.ModRevision <= lastRev {
+					t.Fatalf("event out of order: %d to de %d", e.KV.ModRevision, lastRev)
 				}
-				ultima = e.KV.ModRevision
-				vistos++
+				lastRev = e.KV.ModRevision
+				seen++
 			}
 		case err := <-res.Errorc:
 			t.Fatalf("erro no watch: %v", err)
 		case <-ctxW.Done():
-			t.Fatalf("timeout: recebeu %d de %d eventos", vistos, n)
+			t.Fatalf("timeout: recebeu %d de %d events", seen, n)
 		}
 	}
 }
 
-func TestLeaseExpiraComTombstone(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+func TestLeaseExpiryWritesTombstone(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	chave := "/lease/curta"
 	if _, err := b.Create(ctx, chave, []byte("temporario"), 1); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	prazo := time.Now().Add(10 * time.Second)
-	for time.Now().Before(prazo) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
 		_, kv, err := b.Get(ctx, chave, 0, false)
 		if err != nil {
 			t.Fatalf("Get: %v", err)
@@ -348,18 +339,18 @@ func TestLeaseExpiraComTombstone(t *testing.T) {
 		if kv == nil {
 			var tomb Record
 			if err := b.col.FindOne(ctx, bson.M{"name": chave, "deleted": true}).Decode(&tomb); err != nil {
-				t.Fatalf("a chave expirou sem tombstone: %v", err)
+				t.Fatalf("a key expirou sem tombstone: %v", err)
 			}
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatal("a chave com lease não expirou")
+	t.Fatal("a key com lease did not expire")
 }
 
 func TestCompact(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	chave := "/registry/pods/default/a"
 	rev, err := b.Create(ctx, chave, []byte("v0"), 0)
@@ -373,27 +364,25 @@ func TestCompact(t *testing.T) {
 		}
 	}
 
-	alvo := rev
-	feito, err := b.Compact(ctx, alvo)
+	target := rev
+	done, err := b.Compact(ctx, target)
 	if err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	if feito != alvo {
-		t.Errorf("Compact devolveu %d, esperado %d", feito, alvo)
+	if done != target {
+		t.Errorf("Compact returned %d, want %d", done, target)
 	}
 
-	// O valor corrente precisa sobreviver à compactação.
 	_, kv, err := b.Get(ctx, chave, 0, false)
 	if err != nil {
-		t.Fatalf("Get após compact: %v", err)
+		t.Fatalf("Get after compact: %v", err)
 	}
 	if kv == nil || string(kv.Value) != "v5" {
-		t.Fatalf("após compact, Get devolveu %v, esperado v5", kv)
+		t.Fatalf("after compact, Get returned %v, want v5", kv)
 	}
 
-	// Compactar de novo para a mesma revisão é no-op.
-	if _, err := b.Compact(ctx, alvo); err != server.ErrCompacted {
-		t.Errorf("Compact repetido devolveu %v, esperado ErrCompacted", err)
+	if _, err := b.Compact(ctx, target); err != server.ErrCompacted {
+		t.Errorf("Compact repetido returned %v, want ErrCompacted", err)
 	}
 }
 
@@ -412,22 +401,20 @@ func TestParseDSN(t *testing.T) {
 		t.Errorf("EpochBase=%d", cfg.EpochBase)
 	}
 	if strings.Contains(cfg.URI, "kine_") {
-		t.Errorf("parâmetros kine_ vazaram para a URI: %s", cfg.URI)
+		t.Errorf("kine_ parameters leaked into the URI: %s", cfg.URI)
 	}
 	if !strings.Contains(cfg.URI, "retryWrites=true") {
-		t.Errorf("parâmetro do mongo foi removido: %s", cfg.URI)
+		t.Errorf("a mongo parameter was stripped: %s", cfg.URI)
 	}
 	if _, err := ParseDSN("mongodb://h/?kine_desconhecido=1"); err == nil {
-		t.Error("parâmetro kine_ desconhecido deveria dar erro")
+		t.Error("an unknown kine_ parameter should error")
 	}
 }
 
-// TestWatchersCompartilhamUmStream cobre o MW-2: vários watchers precisam
-// dividir um único change stream, não abrir um cada. Um apiserver tem dezenas
-// de informers, e o M0 admite 500 conexões no total.
-func TestWatchersCompartilhamUmStream(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+// TestWatchersShareOneStream — see docs/implementation-notes.md
+func TestWatchersShareOneStream(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	const nWatchers = 8
 	ctxW, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -437,15 +424,13 @@ func TestWatchersCompartilhamUmStream(t *testing.T) {
 	for i := range res {
 		res[i] = b.Watch(ctxW, "/s/", "/s0", 0)
 		if res[i].Events == nil {
-			t.Fatalf("watcher %d não recebeu canal", i)
+			t.Fatalf("watcher %d got no channel", i)
 		}
 	}
 	time.Sleep(3 * time.Second) // deixa o stream assentar
 
-	// Um único change stream deve estar aberto, independentemente do número
-	// de watchers. O broadcaster chama a ConnectFunc uma vez só.
-	if n := b.streamsAbertos(); n != 1 {
-		t.Errorf("streams abertos = %d, esperado 1 para %d watchers", n, nWatchers)
+	if n := b.openStreams(); n != 1 {
+		t.Errorf("streams abertos = %d, want 1 para %d watchers", n, nWatchers)
 	}
 
 	const nChaves = 4
@@ -455,33 +440,32 @@ func TestWatchersCompartilhamUmStream(t *testing.T) {
 		}
 	}
 
-	// Todos os watchers precisam ver todos os eventos, em ordem.
 	var wg sync.WaitGroup
 	falhas := make([]string, nWatchers)
 	for i := 0; i < nWatchers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			vistos := 0
-			var ultima int64
-			prazo := time.After(35 * time.Second)
-			for vistos < nChaves {
+			seen := 0
+			var lastRev int64
+			deadline := time.After(35 * time.Second)
+			for seen < nChaves {
 				select {
 				case lote, ok := <-res[i].Events:
 					if !ok {
-						falhas[i] = fmt.Sprintf("canal fechou com %d de %d", vistos, nChaves)
+						falhas[i] = fmt.Sprintf("canal fechou com %d de %d", seen, nChaves)
 						return
 					}
 					for _, e := range lote {
-						if e.KV.ModRevision <= ultima {
-							falhas[i] = fmt.Sprintf("fora de ordem: %d após %d", e.KV.ModRevision, ultima)
+						if e.KV.ModRevision <= lastRev {
+							falhas[i] = fmt.Sprintf("out of order: %d after %d", e.KV.ModRevision, lastRev)
 							return
 						}
-						ultima = e.KV.ModRevision
-						vistos++
+						lastRev = e.KV.ModRevision
+						seen++
 					}
-				case <-prazo:
-					falhas[i] = fmt.Sprintf("timeout com %d de %d eventos", vistos, nChaves)
+				case <-deadline:
+					falhas[i] = fmt.Sprintf("timeout com %d de %d events", seen, nChaves)
 					return
 				}
 			}
@@ -495,23 +479,16 @@ func TestWatchersCompartilhamUmStream(t *testing.T) {
 	}
 }
 
-// TestRecuperacaoDeStreamInvalidado cobre o MW-3.
-//
-// Ressalva importante sobre o alcance deste teste: ele exercita o mecanismo de
-// recuperação, não o gatilho. Provocar uma invalidação real exigiria encher a
-// janela do oplog, o que não é viável no M0 — isso fica para o MSPIKE-8. O que
-// se prova aqui é que, dada uma lacuna entre a última revisão observada e o
-// estado atual, a leitura direta a preenche na ordem correta e sem repetir.
-func TestRecuperacaoDeStreamInvalidado(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+// TestInvalidatedStreamBackfill — see docs/implementation-notes.md
+func TestInvalidatedStreamBackfill(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
-	// Marca o ponto a partir do qual os eventos serão considerados perdidos.
-	if _, err := b.Create(ctx, "/r/marco", []byte("v"), 0); err != nil {
+	if _, err := b.Create(ctx, "/r/marker", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.RLock()
-	desde := b.currentRev
+	from_ := b.currentRev
 	b.mu.RUnlock()
 
 	const n = 6
@@ -521,127 +498,112 @@ func TestRecuperacaoDeStreamInvalidado(t *testing.T) {
 		}
 	}
 
-	// Rebobina a revisão observada, simulando um stream que ficou para trás.
 	b.mu.Lock()
-	b.currentRev = desde
+	b.currentRev = from_
 	b.mu.Unlock()
 
 	saida := make(chan server.Events, 64)
-	if ok := b.recuperar(saida); !ok {
-		t.Fatal("recuperar() devolveu false")
+	if ok := b.backfill(saida); !ok {
+		t.Fatal("backfill() returned false")
 	}
 	close(saida)
 
 	var revs []int64
-	chaves := map[string]bool{}
+	keys := map[string]bool{}
 	for lote := range saida {
 		for _, e := range lote {
 			revs = append(revs, e.KV.ModRevision)
-			chaves[e.KV.Key] = true
+			keys[e.KV.Key] = true
 		}
 	}
 
 	if len(revs) != n {
-		t.Fatalf("recuperou %d eventos, esperado %d", len(revs), n)
+		t.Fatalf("recovered %d events, want %d", len(revs), n)
 	}
 	for i := 1; i < len(revs); i++ {
 		if revs[i] <= revs[i-1] {
-			t.Errorf("recuperação fora de ordem: %d após %d", revs[i], revs[i-1])
+			t.Errorf("backfill out of order: %d after %d", revs[i], revs[i-1])
 		}
 	}
 	for i := 0; i < n; i++ {
-		if !chaves[fmt.Sprintf("/r/%d", i)] {
-			t.Errorf("chave /r/%d não foi recuperada", i)
+		if !keys[fmt.Sprintf("/r/%d", i)] {
+			t.Errorf("key /r/%d was not recuperada", i)
 		}
 	}
-	// A revisão observada precisa ter avançado, senão a próxima recuperação
-	// repetiria os mesmos eventos.
 	b.mu.RLock()
-	depois := b.currentRev
+	to := b.currentRev
 	b.mu.RUnlock()
-	if depois <= desde {
-		t.Errorf("currentRev não avançou após a recuperação: %d -> %d", desde, depois)
+	if to <= from_ {
+		t.Errorf("currentRev did not advance after the backfill: %d -> %d", from_, to)
 	}
 }
 
-// TestHistoricoPerdido garante que só os códigos de invalidação disparam a
-// recuperação — um erro de rede comum deve apenas reconectar pelo token.
-func TestHistoricoPerdido(t *testing.T) {
+// TestHistoryLostClassification — see docs/implementation-notes.md
+func TestHistoryLostClassification(t *testing.T) {
 	casos := []struct {
-		nome     string
-		err      error
-		esperado bool
+		name string
+		err  error
+		want bool
 	}{
 		{"nil", nil, false},
 		{"erro comum", errors.New("connection reset"), false},
 		{"ChangeStreamHistoryLost", mongo.CommandError{Code: errChangeStreamHistoryLost}, true},
 		{"ChangeStreamFatalError", mongo.CommandError{Code: errChangeStreamFatalError}, true},
-		{"outro código", mongo.CommandError{Code: 11000}, false},
+		{"another code", mongo.CommandError{Code: 11000}, false},
 	}
 	for _, c := range casos {
-		if got := historicoPerdido(c.err); got != c.esperado {
-			t.Errorf("%s: historicoPerdido=%v, esperado %v", c.nome, got, c.esperado)
+		if got := historyLost(c.err); got != c.want {
+			t.Errorf("%s: historyLost=%v, want %v", c.name, got, c.want)
 		}
 	}
 }
 
-// TestInvalidacaoRealDoOplog fecha a lacuna que o TestRecuperacaoDeStreamInvalidado
-// deixava: aqui a invalidação é REAL, não simulada.
-//
-// Pedir um startAtOperationTime anterior à janela do oplog faz o MongoDB
-// recusar com ChangeStreamHistoryLost (286) — medido no MSPIKE-8, onde a janela
-// do M0 estava em 4,4 h. O que se prova é que o erro chega classificável pelo
-// historicoPerdido() e que abrirStream se recupera dele.
-func TestInvalidacaoRealDoOplog(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+// TestRealOplogInvalidation — see docs/implementation-notes.md
+func TestRealOplogInvalidation(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	if _, err := b.Create(ctx, "/inv/a", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
 
-	// 30 dias atrás cai fora de qualquer janela de oplog concebível.
 	antigo := bson.Timestamp{T: uint32(time.Now().Add(-30 * 24 * time.Hour).Unix()), I: 1}
 	cs, err := b.col.Watch(ctx, mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"operationType": "insert"}}},
 	}, options.ChangeStream().SetStartAtOperationTime(&antigo))
 
-	// O erro pode vir na abertura ou na primeira leitura.
 	if err == nil {
 		cs.TryNext(ctx)
 		err = cs.Err()
 		cs.Close(context.Background())
 	}
 	if err == nil {
-		t.Skip("o MongoDB aceitou um startAtOperationTime de 30 dias atrás — " +
-			"a janela do oplog deve ter crescido; sem invalidação para observar")
+		t.Skip("MongoDB accepted a startAtOperationTime from 30 days ago - " +
+			"the oplog window must have grown; no invalidation to observe")
 	}
 
 	t.Logf("erro devolvido: %v", err)
-	if !historicoPerdido(err) {
-		t.Errorf("historicoPerdido() não reconheceu a invalidação real — "+
-			"a recuperação do MW-3 não dispararia. erro: %v", err)
+	if !historyLost(err) {
+		t.Errorf("historyLost() did not recognise the real invalidation - "+
+			"the MW-3 backfill would never fire. error: %v", err)
 	}
 
-	// E o driver precisa conseguir abrir um stream novo depois disso.
 	b.ctx = ctx
-	novo, err := b.abrirStream(nil)
+	novo, err := b.openStream(nil)
 	if err != nil {
-		t.Fatalf("abrirStream após invalidação falhou: %v", err)
+		t.Fatalf("openStream after invalidation failed: %v", err)
 	}
 	novo.Close(context.Background())
 }
 
-// TestCompactRepetido cobre a lacuna de o Compact nunca ter rodado por tempo
-// real: o apiserver compacta a cada 5 minutos, e se cada ciclo deixar lixo o
-// banco cresce sem limite — no M0, até parar o cluster.
-func TestCompactRepetido(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+// TestRepeatedCompaction — see docs/implementation-notes.md
+func TestRepeatedCompaction(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
-	const chaves, geracoes = 10, 6
+	const keys, geracoes = 10, 6
 	revs := map[string]int64{}
-	for i := 0; i < chaves; i++ {
+	for i := 0; i < keys; i++ {
 		k := fmt.Sprintf("/c/%d", i)
 		r, err := b.Create(ctx, k, []byte("g0"), 0)
 		if err != nil {
@@ -652,7 +614,7 @@ func TestCompactRepetido(t *testing.T) {
 
 	var docs []int64
 	for g := 1; g <= geracoes; g++ {
-		for i := 0; i < chaves; i++ {
+		for i := 0; i < keys; i++ {
 			k := fmt.Sprintf("/c/%d", i)
 			r, _, ok, err := b.Update(ctx, k, []byte(fmt.Sprintf("g%d", g)), revs[k], 0)
 			if err != nil || !ok {
@@ -665,44 +627,39 @@ func TestCompactRepetido(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := b.Compact(ctx, atual); err != nil && err != server.ErrCompacted {
-			t.Fatalf("Compact na geração %d: %v", g, err)
+			t.Fatalf("Compact na generation %d: %v", g, err)
 		}
 		n, err := b.col.CountDocuments(ctx, bson.M{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		docs = append(docs, n)
-		t.Logf("geração %d: %d documentos", g, n)
+		t.Logf("generation %d: %d documents", g, n)
 	}
 
-	// O número de documentos precisa estabilizar: cada ciclo apaga o que o
-	// anterior tornou obsoleto. Se crescer sempre, o compact não está limpando.
-	primeiro, ultimo := docs[0], docs[len(docs)-1]
-	if ultimo > primeiro {
-		t.Errorf("o banco cresceu ao longo dos ciclos de compactação: %d -> %d "+
-			"(compact não está recuperando espaço)", primeiro, ultimo)
+	first, last := docs[0], docs[len(docs)-1]
+	if last > first {
+		t.Errorf("the database grew across compaction cycles: %d -> %d "+
+			"(compact is not reclaiming space)", first, last)
 	}
-	// E o estado corrente precisa continuar íntegro.
-	for i := 0; i < chaves; i++ {
+	for i := 0; i < keys; i++ {
 		k := fmt.Sprintf("/c/%d", i)
 		_, kv, err := b.Get(ctx, k, 0, false)
 		if err != nil {
 			t.Fatalf("Get %s: %v", k, err)
 		}
-		esperado := fmt.Sprintf("g%d", geracoes)
-		if kv == nil || string(kv.Value) != esperado {
-			t.Errorf("%s = %v, esperado %s", k, kv, esperado)
+		want := fmt.Sprintf("g%d", geracoes)
+		if kv == nil || string(kv.Value) != want {
+			t.Errorf("%s = %v, want %s", k, kv, want)
 		}
 	}
 }
 
-// testBackendNaColecao abre um backend adicional sobre a MESMA coleção, para
-// simular dois servidores kine compartilhando um MongoDB.
-func testBackendNaColecao(t *testing.T, db, col string) (*Backend, context.Context, func()) {
+func testBackendOnCollection(t *testing.T, db, col string) (*Backend, context.Context, func()) {
 	t.Helper()
 	uri := os.Getenv("KINE_MONGO_TEST_URI")
 	if uri == "" {
-		t.Skip("KINE_MONGO_TEST_URI não definida")
+		t.Skip("KINE_MONGO_TEST_URI is not set")
 	}
 	sep := "?"
 	if strings.Contains(uri, "?") {
@@ -724,29 +681,21 @@ func testBackendNaColecao(t *testing.T, db, col string) (*Backend, context.Conte
 	return be, ctx, func() { cancel(); wg.Wait() }
 }
 
-// TestDuasInstancias cobre a promessa que o driver faz ao devolver
-// leaderElect=true: vários servidores kine sobre o mesmo MongoDB.
-//
-// A ordenação aqui não depende de coordenação entre processos — a revisão é o
-// clusterTime, que é global ao cluster MongoDB, e o oplog é único. Foi o que
-// permitiu remover os mutexes que a primeira correção do watch introduziu.
-func TestDuasInstancias(t *testing.T) {
+// TestTwoInstances — see docs/implementation-notes.md
+func TestTwoInstances(t *testing.T) {
 	db := "kine_multi"
 	col := fmt.Sprintf("m%d", time.Now().UnixNano())
 
-	a, ctxA, limparA := testBackendNaColecao(t, db, col)
+	a, ctxA, limparA := testBackendOnCollection(t, db, col)
 	defer limparA()
-	b2, ctxB, limparB := testBackendNaColecao(t, db, col)
+	b2, ctxB, limparB := testBackendOnCollection(t, db, col)
 	defer limparB()
 	defer func() { _ = a.col.Drop(context.Background()); _ = a.meta.Drop(context.Background()) }()
 
-	// As duas instâncias precisam concordar no epoch base, senão as revisões
-	// de uma não fazem sentido para a outra.
 	if a.cfg.EpochBase != b2.cfg.EpochBase {
-		t.Fatalf("epoch base divergente: A=%d B=%d", a.cfg.EpochBase, b2.cfg.EpochBase)
+		t.Fatalf("epoch base diverging: A=%d B=%d", a.cfg.EpochBase, b2.cfg.EpochBase)
 	}
 
-	// Um watch na instância A precisa ver o que a instância B escreve.
 	ctxW, cancel := context.WithTimeout(ctxA, 40*time.Second)
 	defer cancel()
 	res := a.Watch(ctxW, "/multi/", "/multi0", 0)
@@ -766,96 +715,87 @@ func TestDuasInstancias(t *testing.T) {
 		revs = append(revs, r)
 	}
 
-	// Revisões geradas por processos diferentes precisam ser globalmente
-	// monotônicas e distintas.
 	vistas := map[int64]bool{}
 	for i, r := range revs {
 		if vistas[r] {
-			t.Errorf("revisão %d repetida entre instâncias", r)
+			t.Errorf("revision %d repetida entre instances", r)
 		}
 		vistas[r] = true
 		if i > 0 && r <= revs[i-1] {
-			t.Errorf("revisões não monotônicas entre instâncias: %d após %d", r, revs[i-1])
+			t.Errorf("revisions not monotonic across instances: %d after %d", r, revs[i-1])
 		}
 	}
 
-	recebidos, ultima := 0, int64(0)
-	prazo := time.After(35 * time.Second)
-	for recebidos < n {
+	received, lastRev := 0, int64(0)
+	deadline := time.After(35 * time.Second)
+	for received < n {
 		select {
 		case lote, ok := <-res.Events:
 			if !ok {
-				t.Fatalf("canal fechou com %d de %d", recebidos, n)
+				t.Fatalf("canal fechou com %d de %d", received, n)
 			}
 			for _, e := range lote {
-				if e.KV.ModRevision <= ultima {
-					t.Errorf("fora de ordem: %d após %d", e.KV.ModRevision, ultima)
+				if e.KV.ModRevision <= lastRev {
+					t.Errorf("out of order: %d after %d", e.KV.ModRevision, lastRev)
 				}
-				ultima = e.KV.ModRevision
-				recebidos++
+				lastRev = e.KV.ModRevision
+				received++
 			}
 		case err := <-res.Errorc:
 			t.Fatalf("watch: %v", err)
-		case <-prazo:
-			t.Fatalf("timeout: %d de %d eventos (a instância A não viu as escritas da B)", recebidos, n)
+		case <-deadline:
+			t.Fatalf("timeout: %d of %d events (instance A did not see B's writes)", received, n)
 		}
 	}
 
-	// Compactação concorrente: só uma pode avançar a revisão, sem corromper.
 	atual, err := a.CurrentRevision(ctxA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	erros := make([]error, 2)
+	failures := make([]error, 2)
 	wg.Add(2)
-	go func() { defer wg.Done(); _, erros[0] = a.Compact(ctxA, atual) }()
-	go func() { defer wg.Done(); _, erros[1] = b2.Compact(ctxB, atual) }()
+	go func() { defer wg.Done(); _, failures[0] = a.Compact(ctxA, atual) }()
+	go func() { defer wg.Done(); _, failures[1] = b2.Compact(ctxB, atual) }()
 	wg.Wait()
 
 	sucessos := 0
-	for _, e := range erros {
+	for _, e := range failures {
 		if e == nil {
 			sucessos++
 		} else if e != server.ErrCompacted {
-			t.Errorf("Compact concorrente devolveu erro inesperado: %v", e)
+			t.Errorf("Compact concurrent returned erro inwant: %v", e)
 		}
 	}
 	if sucessos != 1 {
-		t.Errorf("%d instâncias compactaram com sucesso, esperado exatamente 1", sucessos)
+		t.Errorf("%d instances compactionam com sucesso, want exatamente 1", sucessos)
 	}
 
-	// O estado corrente precisa sobreviver, visto pelas duas.
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("/multi/%d", i)
-		for nome, inst := range map[string]*Backend{"A": a, "B": b2} {
+		for name, inst := range map[string]*Backend{"A": a, "B": b2} {
 			ctx := ctxA
-			if nome == "B" {
+			if name == "B" {
 				ctx = ctxB
 			}
 			_, kv, err := inst.Get(ctx, k, 0, false)
 			if err != nil {
-				t.Fatalf("Get %s em %s: %v", k, nome, err)
+				t.Fatalf("Get %s em %s: %v", k, name, err)
 			}
 			if kv == nil {
-				t.Errorf("instância %s não vê %s após a compactação", nome, k)
+				t.Errorf("instance %s does not see %s after compaction", name, k)
 			}
 		}
 	}
 }
 
-// TestMetricasExpostas cobre o MOPS-1: as métricas precisam existir e ser
-// alimentadas pelas operações reais.
-//
-// O alvo destas métricas vem do MSPIKE-6: sob saturação o Atlas não devolve
-// erro, só atrasa. Então taxa de erro não detecta o problema — latência de
-// escrita e atraso do change stream detectam.
-func TestMetricasExpostas(t *testing.T) {
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+// TestMetricsExposed — see docs/implementation-notes.md
+func TestMetricsExposed(t *testing.T) {
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
 	reg := prometheus.NewRegistry()
-	registrarMetricas(reg)
+	registerMetrics(reg)
 
 	if _, err := b.Create(ctx, "/m/a", []byte("v"), 0); err != nil {
 		t.Fatal(err)
@@ -879,20 +819,18 @@ func TestMetricasExpostas(t *testing.T) {
 	essenciais := []string{
 		"kine_mongo_ops_total",
 		"kine_mongo_op_duration_seconds",
-		// as duas que detectam o modo de falha real
 		"kine_mongo_change_stream_lag_seconds",
 		"kine_mongo_change_stream_reconnects_total",
 		"kine_mongo_storage_bytes",
 		"kine_mongo_current_revision",
 		"kine_mongo_compacted_revision",
 	}
-	for _, nome := range essenciais {
-		if !vistas[nome] {
-			t.Errorf("métrica %s não registrada", nome)
+	for _, name := range essenciais {
+		if !vistas[name] {
+			t.Errorf("metric %s is not registered", name)
 		}
 	}
 
-	// As operações precisam ter alimentado os contadores.
 	achou := map[string]bool{}
 	for _, f := range fams {
 		if f.GetName() != "kine_mongo_ops_total" {
@@ -920,33 +858,30 @@ func TestMetricasExpostas(t *testing.T) {
 	}
 }
 
-// TestBackupRestore cobre o MOPS-4: o runbook de docs/backup-restore.md
-// precisa funcionar de verdade, incluindo a parte que é fácil errar — o
-// kine_meta, que carrega o epoch base.
+// TestBackupRestore — see docs/implementation-notes.md
 func TestBackupRestore(t *testing.T) {
 	if _, err := exec.LookPath("mongodump"); err != nil {
-		t.Skip("mongodump não está no PATH")
+		t.Skip("mongodump is not no PATH")
 	}
 	if _, err := exec.LookPath("mongorestore"); err != nil {
-		t.Skip("mongorestore não está no PATH")
+		t.Skip("mongorestore is not no PATH")
 	}
 	uri := os.Getenv("KINE_MONGO_TEST_URI")
 	if uri == "" {
-		t.Skip("KINE_MONGO_TEST_URI não definida")
+		t.Skip("KINE_MONGO_TEST_URI is not set")
 	}
 
-	b, ctx, limpar := testBackend(t)
-	defer limpar()
+	b, ctx, cleanup := testBackend(t)
+	defer cleanup()
 
-	// Estado a preservar.
-	chaves := map[string]string{}
+	keys := map[string]string{}
 	for i := 0; i < 5; i++ {
 		k := fmt.Sprintf("/backup/k%d", i)
-		v := fmt.Sprintf("valor-%d", i)
+		v := fmt.Sprintf("value-%d", i)
 		if _, err := b.Create(ctx, k, []byte(v), 0); err != nil {
 			t.Fatal(err)
 		}
-		chaves[k] = v
+		keys[k] = v
 	}
 	epochOriginal := b.cfg.EpochBase
 	dbNome := b.cfg.Database
@@ -958,15 +893,12 @@ func TestBackupRestore(t *testing.T) {
 		t.Fatalf("mongodump: %v\n%s", err, saida)
 	}
 
-	// As duas coleções precisam estar no dump — esquecer o _meta é o erro
-	// clássico, e ele carrega o epoch base.
-	for _, esperado := range []string{colNome + ".bson", colNome + "_meta.bson"} {
-		if _, err := os.Stat(filepath.Join(dir, dbNome, esperado)); err != nil {
-			t.Errorf("o dump não contém %s: %v", esperado, err)
+	for _, want := range []string{colNome + ".bson", colNome + "_meta.bson"} {
+		if _, err := os.Stat(filepath.Join(dir, dbNome, want)); err != nil {
+			t.Errorf("the dump does not contain %s: %v", want, err)
 		}
 	}
 
-	// Simula a perda: apaga tudo.
 	if err := b.col.Drop(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -974,7 +906,7 @@ func TestBackupRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n, _ := b.col.CountDocuments(ctx, bson.M{}); n != 0 {
-		t.Fatalf("a coleção não foi apagada: %d documentos", n)
+		t.Fatalf("the collection was not dropped: %d documents", n)
 	}
 
 	rest := exec.CommandContext(ctx, "mongorestore", "--uri="+uri, "--drop",
@@ -983,28 +915,25 @@ func TestBackupRestore(t *testing.T) {
 		t.Fatalf("mongorestore: %v\n%s", err, saida)
 	}
 
-	// O epoch base precisa voltar idêntico, senão as revisões passam a
-	// significar outro instante.
 	var meta metaDoc
 	if err := b.meta.FindOne(ctx, bson.M{"_id": metaID}).Decode(&meta); err != nil {
-		t.Fatalf("kine_meta não voltou: %v", err)
+		t.Fatalf("kine_meta did not come back: %v", err)
 	}
 	if meta.EpochBase != epochOriginal {
-		t.Errorf("epoch base after restore = %d, esperado %d", meta.EpochBase, epochOriginal)
+		t.Errorf("epoch base after restore = %d, want %d", meta.EpochBase, epochOriginal)
 	}
 
-	// E as chaves precisam estar todas lá, com os valores certos.
-	for k, v := range chaves {
+	for k, v := range keys {
 		_, kv, err := b.Get(ctx, k, 0, false)
 		if err != nil {
 			t.Fatalf("Get %s: %v", k, err)
 		}
 		if kv == nil {
-			t.Errorf("%s não voltou do backup", k)
+			t.Errorf("%s did not come back do backup", k)
 			continue
 		}
 		if string(kv.Value) != v {
-			t.Errorf("%s = %q, esperado %q", k, kv.Value, v)
+			t.Errorf("%s = %q, want %q", k, kv.Value, v)
 		}
 	}
 }
