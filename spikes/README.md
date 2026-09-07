@@ -31,7 +31,7 @@ python3 -m venv ~/.config/kine-mongo/venv
 | MSPIKE-3 | Transações multi-documento funcionam no M0? | ✅ [concluído](results/mspike-2-3.md) |
 | MSPIKE-4 | Como gerar revisões: contador vs clusterTime | ✅ [concluído](results/mspike-4.md) |
 | MSPIKE-5 | Latência das queries reais do kine | ✅ [concluído](results/mspike-5-9.md) |
-| MSPIKE-6 | Teto de 100 ops/s: o que acontece ao estourar? | ⬜ aberto |
+| MSPIKE-6 | Teto de 100 ops/s: o que acontece ao estourar? | ✅ [concluído](results/mspike-6.md) — zero erros, mas p99 de 63s |
 | MSPIKE-7 | Tamanho em disco de um cluster | ✅ [concluído](results/mspike-5-9.md) |
 | MSPIKE-8 | Janela do oplog e invalidação de Change Stream | ✅ [concluído](results/mspike-8.md) |
 | MSPIKE-9 | Modelo de documento e índices | ✅ [concluído](results/mspike-5-9.md) |

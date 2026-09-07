@@ -157,6 +157,16 @@ Se cada mutação custar ~2 ops (`findAndModify` + insert):
 
 ## 6. Riscos
 
+### 6.0 ✅ ~~Teto de 100 ops/s~~ — MEDIDO (MSPIKE-6)
+
+A premissa que justificou trocar o D1 pelo Mongo: excesso de carga vira lentidão, não fatura. **Confirmada** — zero erros até 6× o teto ([`spikes/results/mspike-6.md`](spikes/results/mspike-6.md)).
+
+Mas o preço da lentidão é alto e não aparece como erro: o p99 de escrita sai de 810 ms (metade do teto) para **63 s** (6× o teto), e o change stream fica **44 s atrasado**. Com `RenewDeadline` de 10 s na leader election, isso derruba scheduler e controller-manager sem gerar uma linha de erro.
+
+Teto real: **~92 ops/s de escrita** ≈ **30 mutações/s** de cluster com latência sadia. Contra 3,3 (ocioso) e 10 (operação) do modelo, é folga de 3× a 9×.
+
+Comparado ao D1: lá o excesso quebrava o orçamento, aqui quebra o cluster. A troca continua valendo — falha visível é melhor que fatura silenciosa — mas "melhor" não é "indolor".
+
 ### 6.1 🔴 Change Streams ou transações indisponíveis no M0
 
 Os dois pilares do desenho. Se qualquer um faltar no free tier, o projeto muda de forma: sem Change Streams volta-se ao polling (perdendo a principal vantagem); sem transações é preciso um padrão CAS como o do D1. **Eliminatório para o alvo M0 — não para o projeto**, que cairia para o Flex (teto de US$ 30/mês).

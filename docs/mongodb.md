@@ -102,10 +102,35 @@ Contra um Atlas M0 em São Paulo, e um k3s v1.36.4 real em EC2:
 | Tamanho de um cluster k3s inteiro | **~1 MB** (842 documentos) |
 | Projeção nos 512 MB do M0 | **~429 mil documentos** |
 | Janela do oplog no M0 | **~4,4 h** |
+| Teto real de escrita (M0) | **~92 ops/s** — acima disso a latência explode |
+| Teto prático de mutações do cluster | **~30/s** (cada mutação custa ~2 ops) |
 
 Detalhes e como reproduzir em [`spikes/results/`](../spikes/results/).
 
 ---
+
+## Capacidade e o que monitorar
+
+O teto do M0 é **~92 operações/s de escrita**. Cada mutação do kine custa ~2 operações (o insert e o update que grava a revisão), então:
+
+| | Mutações/s do cluster |
+|---|---|
+| Teto absoluto | ~45 |
+| **Onde a latência ainda é sadia** | **~30** |
+| Cluster médio ocioso | 3,3 |
+| Cluster médio em operação | 10 |
+
+Folga de 3× a 9× para um cluster médio — suficiente, não confortável.
+
+**O que estourar o teto faz não é falhar; é ficar lento.** Medido em [MSPIKE-6](../spikes/results/mspike-6.md): zero erros até 6× o teto, mas o p99 de escrita sai de 810 ms para **63 s**, e o change stream fica **44 s atrasado**. Para o Kubernetes isso é pior que um erro: a leader election tem `RenewDeadline` de 10 s, então scheduler e controller-manager perdem a liderança sem que nada no log diga por quê.
+
+Por isso, o que monitorar **não é taxa de erro** — não vai haver erro:
+
+| Sinal | Alerta |
+|---|---|
+| **Latência de escrita p99** | acima de ~1 s, o cluster está a caminho de perder a liderança |
+| **Atraso do change stream** | acima de alguns segundos, os informers estão obsoletos |
+| Storage usado | o M0 não expande; ao encher, o cluster para |
 
 ## Quando não usar
 
@@ -114,7 +139,7 @@ Seja honesto sobre o que isso é.
 **Não use se:**
 
 - **É produção crítica.** Este driver é novo, não tem uso em campo, e não passou pela suíte de conformidade etcd completa (`MT-2`).
-- **O cluster tem muito churn** — CI criando milhares de Jobs, operadores com reconcile agressivo. Não foi testado sob carga sustentada (`MT-4`).
+- **O cluster tem muito churn** — CI criando milhares de Jobs, operadores com reconcile agressivo. O teto é ~30 mutações/s antes da latência machucar a leader election ([MSPIKE-6](../spikes/results/mspike-6.md)), e o sintoma de estourar é o cluster travando sem mensagem de erro.
 - **A latência importa.** Cada operação do apiserver paga a ida e volta até o MongoDB. Com o banco longe, isso vira dezenas ou centenas de milissegundos, e a leader election tem deadlines de 5-10 s.
 - **Você precisa de backup automático no M0.** O free tier não tem; só `mongodump` manual.
 - **Não pode usar replica set.** Standalone não serve.
@@ -127,7 +152,8 @@ Seja honesto sobre o que isso é.
 |---|---|
 | Watch fica para trás da janela do oplog (~4,4 h no M0) e invalida | Tratado: o driver detecta `ChangeStreamHistoryLost` e recupera por leitura direta ([MW-3](../spikes/results/mt3.md)) |
 | M0 não expande storage — ao encher, o cluster para | Folga grande (~429 mil documentos), mas **sem alerta ainda** (`MOPS-1` aberto) |
-| Teto de 100 ops/s no M0 | Não medido no limite (`MSPIKE-6` aberto) |
+| Teto de 100 ops/s no M0 | **Medido** ([MSPIKE-6](../spikes/results/mspike-6.md)): não gera erro, gera latência. p99 vai a **63 s** a 6× o teto — e a leader election tem deadline de 10 s |
+| Change stream fica para trás sob carga | **Medido**: 44 s de atraso a 6× o teto, sem perder evento. Um watch atrasado é um cluster que não vê suas mudanças |
 | Revisões não são densas — saltam | Por desenho ([ADR-0001](adr/0001-revisao-por-clustertime.md)). O apiserver trata `resourceVersion` como valor opaco; validado com k3s real |
 | Órfão com `rev = 0` se o processo morrer entre insert e update | Inerte, não corrompe estado ([ADR-0002](adr/0002-watch-por-clustertime-do-insert.md)) |
 
