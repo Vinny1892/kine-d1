@@ -17,6 +17,14 @@ die()  { printf '\033[31merro:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "rode com sudo"
 command -v k3s >/dev/null 2>&1 || die "k3s não está instalado — rode antes o hack/k3s-mongo.sh"
 
+# Um k3s órfão segura o lock e a porta 6443, e a falha resultante não aponta
+# para a causa. O k3s-killall.sh não pega instâncias iniciadas à mão.
+if pgrep -f "k3s server" >/dev/null 2>&1; then
+  echo "  processos k3s já rodando:" >&2
+  ps -o pid,stat,etime,comm -p "$(pgrep -f 'k3s server' | tr '\n' ',' | sed 's/,$//')" >&2 2>/dev/null
+  die "derrube tudo primeiro: sudo ./hack/k3s-limpar.sh"
+fi
+
 info "verificando se o kine responde em $KINE_ADDR"
 timeout 5 bash -c "</dev/tcp/${KINE_ADDR/:/\/}" 2>/dev/null \
   || die "nada escutando em $KINE_ADDR — suba o kine primeiro"
