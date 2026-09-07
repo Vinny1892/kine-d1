@@ -147,39 +147,27 @@ What hurts is **concurrency**, not volume.
 
 ---
 
-## Local environment state
+## Test artifacts outside the repo
 
-Things left running on this machine, on purpose. Check before assuming a clean
-slate:
+What the test setup needs, and what it may have left behind:
+
+- `~/.config/kine-mongo/env` — credentials, `chmod 600`
+- `~/.config/kine-mongo/venv/` — Python venv with `pymongo`, for the spikes
+- `~/.local/bin/mongodump`, `mongorestore` — needed by `TestBackupRestore`,
+  which skips without them
+
+Containers from earlier test runs may still be up:
 
 ```bash
 docker ps -a --filter name=kine-
 ```
 
-| | |
-|---|---|
-| `kine-test` | kine on SQLite, image `kine-mongo:codex-test` |
-| `kine-k3s-test` | k3s control plane against it (`--disable-agent`) |
-| `kine-k3s-test-net` | the Docker network both share |
+`kine-test` + `kine-k3s-test` on the `kine-k3s-test-net` network are a SQLite
+smoke test, useful for separating driver problems from k3s→kine problems.
 
-That pair is a SQLite smoke test, kept to separate driver problems from
-k3s→kine problems. `docker exec kine-k3s-test kubectl get --raw=/readyz`
-returns `ok`. Remove them only when you are sure nobody needs the comparison.
-
-Also present outside the repo:
-
-- `~/.config/kine-mongo/env` — credentials, `chmod 600`
-- `~/.config/kine-mongo/venv/` — Python venv with `pymongo`, for the spikes
-- `~/.local/bin/mongodump`, `mongorestore` — needed by `TestBackupRestore`
-- `~/repo` — **was a symlink** to `/mnt/wsl/PHYSICALDRIVE3/repo` and is now an
-  empty directory. It was replaced while diagnosing a Docker Desktop failure;
-  the original target is recorded in
-  `~/.config/kine-mongo/repo-symlink-original.txt`. Restore it with
-  `ln -s` once that disk is mounted again.
-
-AWS: nothing is left running. `hack/ec2-mt3.sh destruir` cleans up instance,
-security group and key pair; the last run was verified at zero instances in
-both `sa-east-1` and `us-east-1`.
+AWS: `hack/ec2-mt3.sh destruir` removes instance, security group and key pair.
+Verify with `aws ec2 describe-instances --filters
+"Name=tag:Projeto,Values=kine-mongo"` before assuming it is clean.
 
 ---
 
