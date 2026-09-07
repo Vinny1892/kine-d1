@@ -25,6 +25,12 @@ die()  { printf '\033[31merro:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "rode com sudo — o k3s precisa de root"
 
+# Um k3s sobrevivente de execução anterior segura o lock e a porta 6443, e a
+# falha resultante ("runtime core not ready") não aponta para a causa.
+if pgrep -f "k3s server" >/dev/null 2>&1; then
+  die "já existe um k3s rodando — derrube com: sudo systemctl stop k3s; sudo k3s-killall.sh"
+fi
+
 if [ -z "${MONGO_URI:-}" ] && [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   set -a; source "$ENV_FILE"; set +a
@@ -32,10 +38,61 @@ fi
 [ -n "${MONGO_URI:-}" ] || die "MONGO_URI não definida (nem em $ENV_FILE)"
 
 mkdir -p "$LOG_DIR"
+[ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$LOG_DIR"
 
 # --- 1. compila o kine com o driver mongo ---------------------------------
+# achar_go localiza o compilador. O sudo reseta o PATH (secure_path), e
+# gerenciadores de versão como mise ou asdf instalam o go dentro do home do
+# usuário — para o root, `go` simplesmente não existe. Os shims do mise
+# também não servem: são links para o próprio mise, que depende do hook de
+# shell. Só o caminho absoluto da instalação funciona sob sudo.
+# Requer a versão do go.mod: um mise com várias versões instaladas costuma
+# ter uma antiga primeiro na ordem do glob, e compilar com ela falha.
+achar_go() {
+  local minima
+  minima="$(awk '/^go /{print $2; exit}' "$RAIZ/go.mod" 2>/dev/null)"
+  minima="${minima:-1.26}"
+
+  local candidatos=() c
+  [ -n "${GO:-}" ] && candidatos+=("$GO")
+  command -v go >/dev/null 2>&1 && candidatos+=("$(command -v go)")
+  local home_usr="${SUDO_USER:+/home/$SUDO_USER}"
+  for c in "$home_usr"/.local/share/mise/installs/go/*/bin/go \
+           "$home_usr"/.asdf/installs/golang/*/go/bin/go \
+           /usr/local/go/bin/go /usr/lib/go/bin/go /snap/bin/go; do
+    [ -x "$c" ] && candidatos+=("$c")
+  done
+
+  # escolhe a maior versão que satisfaça o go.mod
+  local melhor="" melhor_v=""
+  for c in "${candidatos[@]}"; do
+    [ -x "$c" ] || continue
+    local v
+    v="$("$c" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')"
+    [ -n "$v" ] || continue
+    # v >= minima ?
+    [ "$(printf '%s\n%s\n' "$minima" "$v" | sort -V | head -1)" = "$minima" ] || continue
+    if [ -z "$melhor_v" ] || \
+       [ "$(printf '%s\n%s\n' "$melhor_v" "$v" | sort -V | tail -1)" = "$v" ]; then
+      melhor="$c"; melhor_v="$v"
+    fi
+  done
+  echo "$melhor"
+}
+
 info "compilando o kine"
-(cd "$RAIZ" && go build -o "$LOG_DIR/kine" .) || die "falha ao compilar"
+GOBIN_REAL="$(achar_go)"
+[ -n "$GOBIN_REAL" ] || die "não encontrei um go que satisfaça o go.mod ($(awk '/^go /{print $2; exit}' go.mod)) — exporte GO=/caminho/para/go"
+info "usando $GOBIN_REAL ($("$GOBIN_REAL" version 2>/dev/null | awk '{print $3}'))"
+
+# Compila como o usuário original para não deixar artefatos root-owned no
+# repositório nem no cache de módulos.
+if [ -n "${SUDO_USER:-}" ]; then
+  sudo -u "$SUDO_USER" env HOME="/home/$SUDO_USER" \
+    "$GOBIN_REAL" build -C "$RAIZ" -o "$LOG_DIR/kine" . || die "falha ao compilar"
+else
+  "$GOBIN_REAL" build -C "$RAIZ" -o "$LOG_DIR/kine" . || die "falha ao compilar"
+fi
 ok "binário em $LOG_DIR/kine"
 
 # --- 2. sobe o kine --------------------------------------------------------
@@ -71,10 +128,24 @@ info "subindo o k3s com --datastore-endpoint=http://$KINE_ADDR"
 k3s server \
   --datastore-endpoint="http://$KINE_ADDR" \
   --disable traefik --disable servicelb --disable metrics-server \
+  --kubelet-arg=fail-swap-on=false \
   --write-kubeconfig-mode 644 \
   > "$LOG_DIR/k3s.log" 2>&1 &
 K3S_PID=$!
-trap 'kill $K3S_PID $KINE_PID 2>/dev/null || true' EXIT
+# O k3s faz re-exec e sobe containerd e pods como processos separados, então
+# um kill no PID original deixa órfãos — que seguram o
+# /var/lib/rancher/k3s/data/.lock e a porta 6443, travando qualquer tentativa
+# seguinte no "runtime core not ready". O k3s-killall.sh é o único jeito
+# confiável de derrubar tudo.
+limpar_tudo() {
+  kill "$KINE_PID" 2>/dev/null || true
+  if command -v k3s-killall.sh >/dev/null 2>&1; then
+    k3s-killall.sh >/dev/null 2>&1 || true
+  else
+    kill "$K3S_PID" 2>/dev/null || true
+  fi
+}
+trap limpar_tudo EXIT
 
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 info "esperando o nó ficar Ready (pode levar alguns minutos)"
