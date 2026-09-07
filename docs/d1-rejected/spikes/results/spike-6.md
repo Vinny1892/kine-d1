@@ -1,6 +1,6 @@
 # SPIKE-6 — Batch atômico e o padrão CAS da compactação
 
-**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0002](../../adr-0002-transacao-diferida.md)
+**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0002](../../adr-0002-deferred-transaction.md)
 
 ## A pergunta
 

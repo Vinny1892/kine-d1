@@ -1,31 +1,34 @@
-# MSPIKE-8 — Janela do oplog e invalidação real de Change Stream
+# MSPIKE-8 — Oplog window and real change stream invalidation
 
-**Status:** ✅ concluído · **Data:** 2026-09-07
+**Status:** ✅ done · **Date:** 2026-09-07
 
-Fecha a lacuna que o MW-3 deixou: a recuperação estava implementada e testada no *mecanismo*, mas nunca no *gatilho*. Aqui a invalidação é provocada de verdade.
+Closes the gap MW-3 left: the backfill was implemented and tested on the
+*mechanism*, never on the *trigger*. Here the invalidation is provoked for real.
 
-## A janela do oplog no M0
+## The oplog window on M0
 
-O `collStats` do oplog é bloqueado no free tier, mas `local.oplog.rs` é **legível**. Medindo o primeiro e o último registro:
+`collStats` on the oplog is blocked on the free tier, but `local.oplog.rs` is
+**readable**. Measuring its first and last entries:
 
 ```
-mais antigo:  2026-09-06 17:33:52
-mais recente: 2026-09-06 21:58:02
-janela:       15.850 s = 4,4 h
-entradas:     ~16.494
+oldest:  2026-09-06 17:33:52
+newest:  2026-09-06 21:58:02
+window:  15,850 s = 4.4 h
+entries: ~16,494
 ```
 
-**~4,4 horas de janela.** Um watch pode ficar até esse tempo para trás antes de invalidar. A janela é por volume, não por tempo: quanto mais escrita, mais curta.
+**A ~4.4 hour window.** A watch can fall that far behind before invalidating.
+The window is bounded by volume, not time: the more writing, the shorter it is.
 
-## A invalidação acontece, e com o código esperado
+## Invalidation happens, with the expected code
 
-Abrindo change stream com `startAtOperationTime` progressivamente mais antigo:
+Opening a change stream with progressively older `startAtOperationTime`:
 
-| Ponto de retomada | Resultado |
+| Resume point | Result |
 |---|---|
-| 1 hora atrás | aceito |
-| 1 dia atrás | aceito |
-| **30 dias atrás** | **recusado — código 286** |
+| 1 hour ago | accepted |
+| 1 day ago | accepted |
+| **30 days ago** | **rejected — code 286** |
 
 ```
 (ChangeStreamHistoryLost) PlanExecutor error during aggregation ::
@@ -33,31 +36,42 @@ caused by :: Resume of change stream was not possible, as the resume
 point may no longer be in the oplog.
 ```
 
-**286 = `ChangeStreamHistoryLost`**, que é exatamente um dos dois códigos que o `historicoPerdido()` do driver trata (o outro é 280, `ChangeStreamFatalError`).
+**286 = `ChangeStreamHistoryLost`**, which is exactly one of the two codes the
+driver's `historyLost()` handles (the other being 280,
+`ChangeStreamFatalError`).
 
-Curiosidade útil: aceitar "1 dia atrás" quando a janela medida é de 4,4 h mostra que o MongoDB não valida o timestamp na abertura — o erro só aparece quando o stream tenta ler. Por isso o driver classifica o erro em `cs.Err()` e não no `Watch()`.
+A useful detail: accepting "1 day ago" when the measured window is 4.4 h shows
+that MongoDB does not validate the timestamp when the stream opens — the error
+only surfaces when it first reads. That is why the driver classifies the error
+from `cs.Err()` and not from `Watch()`.
 
-## Validação end-to-end
+## End-to-end validation
 
-`TestInvalidacaoRealDoOplog` (em `pkg/drivers/mongo/integration_test.go`):
+`TestRealOplogInvalidation` (in `pkg/drivers/mongo/integration_test.go`):
 
-1. Provoca a invalidação real com um ponto de retomada de 30 dias atrás.
-2. Confirma que `historicoPerdido()` reconhece o erro — se não reconhecesse, a recuperação do MW-3 nunca dispararia.
-3. Confirma que `abrirStream(nil)` consegue abrir um stream novo depois da falha.
+1. Provokes real invalidation with a resume point 30 days old.
+2. Confirms `historyLost()` recognises the error — if it did not, the MW-3
+   backfill would never fire.
+3. Confirms `openStream(nil)` can open a fresh stream afterwards.
 
-O teste tem um `Skip` para o caso de o MongoDB passar a aceitar 30 dias: melhor pular declaradamente do que passar sem ter observado nada.
+The test has a `Skip` in case MongoDB starts accepting 30 days: better to skip
+declaredly than to pass without having observed anything.
 
-## Conclusão
+## Conclusion
 
-O risco está tratado. O que muda na operação:
+The risk is handled. What it means operationally:
 
-- A janela de **4,4 h** é folgada para um kine saudável, mas some se o processo ficar parado uma tarde ou se o volume de escrita subir muito.
-- Quando invalida, o driver detecta e preenche o buraco lendo a coleção entre a última revisão observada e agora — sem perder evento.
-- A janela **não é observável em runtime** no M0 (`collStats` bloqueado), então não há como alertar preventivamente. O desenho certo é o que está: tratar a invalidação quando ela ocorre, em vez de tentar prevê-la.
+- The **4.4 h** window is generous for a healthy kine, but it disappears if the
+  process sits idle for an afternoon or if write volume climbs sharply.
+- On invalidation, the driver detects it and fills the gap by reading the
+  collection between the last observed revision and now — without losing events.
+- The window is **not observable at runtime** on M0 (`collStats` blocked), so
+  there is no way to alert preemptively. The right design is what is in place:
+  handle invalidation when it happens rather than trying to predict it.
 
-## Reproduzir
+## Reproduce
 
 ```bash
 spikes/mspike-8-oplog.py
-go test -tags=integration ./pkg/drivers/mongo/ -run TestInvalidacaoRealDoOplog -v
+go test -tags=integration ./pkg/drivers/mongo/ -run TestRealOplogInvalidation -v
 ```

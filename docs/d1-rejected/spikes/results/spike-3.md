@@ -1,6 +1,6 @@
 # SPIKE-3 — Representação de BLOB sobre a REST API JSON do D1
 
-**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0001](../../adr-0001-representacao-de-blob.md)
+**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0001](../../adr-0001-blob-representation.md)
 
 ## A pergunta
 
@@ -67,7 +67,7 @@ Funcionaria. Por 48 KB de margem. Isso não é margem, é sorte.
 
 ## Decisão
 
-**hex + `unhex()`**, com compressão por cima (`DRV-6`). Detalhes e alternativas descartadas em [ADR-0001](../../adr-0001-representacao-de-blob.md).
+**hex + `unhex()`**, com compressão por cima (`DRV-6`). Detalhes e alternativas descartadas em [ADR-0001](../../adr-0001-blob-representation.md).
 
 ## Reproduzir
 

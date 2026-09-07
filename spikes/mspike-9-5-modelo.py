@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""MSPIKE-9 + MSPIKE-5 — modelo de documento, índices e latência das queries reais.
+"""MSPIKE-9 + MSPIKE-5 — document model, indexes and latency of the real queries.
 
-Define o schema em BSON equivalente à tabela kine e verifica que cada query do
-backend usa índice (IXSCAN), nunca COLLSCAN. Depois mede p50/p95/p99 de cada uma.
+Defines the BSON schema equivalent to the kine table and checks each backend
+query uses an index (IXSCAN), never COLLSCAN. Then measures p50/p95/p99.
 
-Revisão = clusterTime codificado em int64 (ADR-0001).
+Revision = clusterTime encoded as int64 (ADR-0001).
 
-Uso:  spikes/mspike-9-5-modelo.py [n_chaves]
+Usage:  spikes/mspike-9-5-modelo.py [n_chaves]
 """
 import os, sys, time, statistics
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mongo
-from mongo import titulo
+from mongo import section
 from pymongo import ASCENDING, DESCENDING
 from bson.binary import Binary
 
@@ -22,8 +22,8 @@ EPOCH_BASE = 1_700_000_000          # ADR-0001: evita estourar o int64 em 2038
 def rev_de(ts):
     return ((ts.time - EPOCH_BASE) << 20) | ts.inc
 
-def plano(col, desc, fn):
-    """Roda um explain e diz se usou índice."""
+def plan(col, desc, fn):
+    """Runs an explain and reports whether an index was used."""
     try:
         ex = fn()
         st = ex.get("queryPlanner", {}).get("winningPlan", {})
@@ -40,9 +40,9 @@ def plano(col, desc, fn):
 def main():
     c = mongo.client(); d = c[mongo.DB]
     kv = d["kine"]; kv.drop()
-    print(f"\nMSPIKE-9 + MSPIKE-5 — modelo, índices e latência ({N_CHAVES} chaves)\n")
+    print(f"\nMSPIKE-9 + MSPIKE-5 — model, indexes and latency ({N_CHAVES} keys)\n")
 
-    titulo("1. Schema BSON e índices")
+    section("1. BSON schema and indexes")
     kv.create_index([("name", ASCENDING), ("_id", DESCENDING)], name="name_rev")
     kv.create_index([("name", ASCENDING), ("prev_revision", ASCENDING)],
                     name="name_prev_uniq", unique=True)
@@ -53,23 +53,23 @@ def main():
       create_revision: int64, prev_revision: int64, lease: int64,
       value: BinData, old_value: BinData, expires_at: Date|null }""")
     for i in kv.list_indexes():
-        print(f"    índice {i['name']:<16} {dict(i['key'])}"
+        print(f"    index {i['name']:<16} {dict(i['key'])}"
               + ("  UNIQUE" if i.get("unique") else "")
               + ("  TTL" if "expireAfterSeconds" in i else ""))
 
-    titulo("2. Popular e medir a escrita (revisão via clusterTime)")
+    section("2. Populate and measure writes (revision via clusterTime)")
     def escrever(nome, prev, valor):
         with c.start_session() as s:
             ts = None
             doc = {"name": nome, "created": prev == 0, "deleted": False,
                    "create_revision": 0, "prev_revision": prev, "lease": 0,
                    "value": Binary(valor), "old_value": None, "expires_at": None}
-            # _id precisa do clusterTime, que só é conhecido após a escrita:
-            # insere com _id provisório ObjectId e reescreve? Não — usa o padrão:
-            # escreve e lê operation_time, gravando a revisão num segundo campo.
+            # _id would need the clusterTime, known only after the write:
+            # insert with a provisional ObjectId and rewrite? No - use the pattern:
+            # write, read operation_time, store the revision in a second field.
             r = kv.insert_one({**doc, "_id": None}, session=s) if False else None
             return s
-    # padrão real: insert com _id gerado a partir do clusterTime da própria sessão
+    # real pattern: insert, then store the session's clusterTime as the revision
     # exige duas etapas; medimos a que o backend vai usar de fato:
     lat_w = []
     for i in range(N_CHAVES):
@@ -89,21 +89,21 @@ def main():
     print(f"  {N_CHAVES} chaves escritas")
     print(f"  insert + set(rev): p50={statistics.median(lat_w):.1f}ms  "
           f"p95={mongo.pct(lat_w,.95):.1f}ms  p99={mongo.pct(lat_w,.99):.1f}ms")
-    print("  ⚠ duas operações por escrita — a revisão só existe depois do insert")
+    print("  ⚠ two operations per write - the revision only exists after the insert")
 
-    titulo("3. As queries do backend usam índice?")
+    section("3. Do the backend queries use an index?")
     pref, fim = "/registry/pods/default/", "/registry/pods/default0"
     ok = []
-    ok.append(plano(kv, "Get: última revisão de uma chave",
+    ok.append(plan(kv, "Get: a key's latest revision",
         lambda: kv.find({"name": "/registry/pods/default/p1"}).sort("rev", -1).limit(1).explain()))
-    ok.append(plano(kv, "After: revisões > X (watch/poll)",
+    ok.append(plan(kv, "After: revisions > X (watch/poll)",
         lambda: kv.find({"rev": {"$gt": 0}}).sort("rev", 1).limit(500).explain()))
-    ok.append(plano(kv, "List: range de prefixo",
+    ok.append(plan(kv, "List: range de prefixo",
         lambda: kv.find({"name": {"$gte": pref, "$lt": fim}}).sort("name", 1).explain()))
-    ok.append(plano(kv, "Compact: por prev_revision",
+    ok.append(plan(kv, "Compact: por prev_revision",
         lambda: kv.find({"prev_revision": {"$ne": 0}, "rev": {"$lte": 10**18}}).explain()))
 
-    titulo("4. ListCurrent — a query mais cara (equivale ao MAX(id) GROUP BY name)")
+    section("4. ListCurrent — a query mais cara (equivale ao MAX(id) GROUP BY name)")
     pipe = [
         {"$match": {"name": {"$gte": pref, "$lt": fim}}},
         {"$sort": {"name": 1, "rev": -1}},
@@ -115,47 +115,47 @@ def main():
     ex = d.command("explain", {"aggregate": "kine", "pipeline": pipe, "cursor": {}},
                    verbosity="queryPlanner")
     txt = str(ex)
-    print(f"  usa índice: {'✓ IXSCAN' if 'IXSCAN' in txt else '✗ COLLSCAN'}")
-    lat = mongo.cronometrar(lambda: list(kv.aggregate(pipe)), 10)
+    print(f"  uses index: {'✓ IXSCAN' if 'IXSCAN' in txt else '✗ COLLSCAN'}")
+    lat = mongo.timeit(lambda: list(kv.aggregate(pipe)), 10)
     n = len(list(kv.aggregate(pipe)))
     print(f"  {n} chaves retornadas")
-    mongo.resumo("ListCurrent (agregação)", lat)
-    print(f"  para comparação, o D1 media 1039ms para 300 chaves")
+    mongo.summary("ListCurrent (aggregation)", lat)
+    print(f"  for comparison, D1 measured 1039ms for 300 keys")
 
-    titulo("5. Latência das demais queries")
-    mongo.resumo("Get de 1 chave", mongo.cronometrar(
+    section("5. Latency of the remaining queries")
+    mongo.summary("Get de 1 chave", mongo.timeit(
         lambda: kv.find_one({"name": "/registry/pods/default/p7"}, sort=[("rev", -1)]), 25))
-    mongo.resumo("After — com eventos", mongo.cronometrar(
+    mongo.summary("After — com eventos", mongo.timeit(
         lambda: list(kv.find({"rev": {"$gt": 0}}).sort("rev", 1).limit(500)), 10))
-    mongo.resumo("After — ocioso", mongo.cronometrar(
+    mongo.summary("After — ocioso", mongo.timeit(
         lambda: list(kv.find({"rev": {"$gt": 2**62}}).sort("rev", 1).limit(500)), 25))
-    mongo.resumo("CurrentRevision (max rev)", mongo.cronometrar(
+    mongo.summary("CurrentRevision (max rev)", mongo.timeit(
         lambda: kv.find_one({}, sort=[("rev", -1)], projection={"rev": 1}), 25))
-    mongo.resumo("Count por prefixo", mongo.cronometrar(
+    mongo.summary("Count por prefixo", mongo.timeit(
         lambda: kv.count_documents({"name": {"$gte": pref, "$lt": fim}}), 25))
 
-    titulo("6. UNIQUE(name, prev_revision) — a detecção de chave duplicada")
+    section("6. UNIQUE(name, prev_revision) - duplicate key detection")
     from pymongo.errors import DuplicateKeyError
     try:
         kv.insert_one({"name": "/registry/pods/default/p1", "prev_revision": 0, "rev": 1})
-        print("  ✗ passou — a constraint NÃO está funcionando")
+        print("  ✗ passed - the constraint is NOT working")
     except DuplicateKeyError as e:
         print(f"  ✓ rejeitado: {str(e)[:120]}")
-        print("  => mapeável para server.ErrKeyExists via DuplicateKeyError (code 11000)")
+        print("  => maps to server.ErrKeyExists via DuplicateKeyError (code 11000)")
 
-    titulo("7. Tamanho em disco (MSPIKE-7 parcial)")
+    section("7. Tamanho em disco (MSPIKE-7 parcial)")
     st = d.command("collStats", "kine")
-    print(f"  {st['count']} documentos de {VAL//1024} KB")
+    print(f"  {st['count']} documents de {VAL//1024} KB")
     print(f"  dataSize={st['size']:,}  storageSize={st['storageSize']:,}  "
           f"totalIndexSize={st['totalIndexSize']:,}")
     total = st['storageSize'] + st['totalIndexSize']
     por_doc = total / max(st['count'], 1)
-    print(f"  por documento (com índices): {por_doc:,.0f} bytes")
-    print(f"  compressão: dataSize/storageSize = {st['size']/max(st['storageSize'],1):.1f}x")
+    print(f"  per document (with indexes): {por_doc:,.0f} bytes")
+    print(f"  compression: dataSize/storageSize = {st['size']/max(st['storageSize'],1):.1f}x")
     cabe = int(512*1024*1024 / por_doc)
-    print(f"\n  => em 512 MB cabem ~{cabe:,} documentos de {VAL//1024} KB")
+    print(f"\n  => em 512 MB cabem ~{cabe:,} documents de {VAL//1024} KB")
 
-    print("\n(a coleção kine foi mantida para o MSPIKE-6/7)")
+    print("\n(the kine collection was kept for MSPIKE-6/7)")
 
 if __name__ == "__main__":
     main()

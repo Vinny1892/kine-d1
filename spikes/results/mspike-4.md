@@ -1,59 +1,75 @@
-# MSPIKE-4 — Como gerar revisões: o desenho mudou
+# MSPIKE-4 — How to generate revisions: the design changed here
 
-**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0001](../../docs/adr/0001-revision-from-clustertime.md)
+**Status:** ✅ done · **Date:** 2026-09-06 · **Decision:** [ADR-0001](../../docs/adr/0001-revision-from-clustertime.md)
 
-## O problema
+## The problem
 
-No kine a revisão do etcd é o `id` da linha (`AUTOINCREMENT`). O apiserver depende de três propriedades: **monotônica**, **sem buracos permanentes**, **visível em ordem**. MongoDB não tem AUTOINCREMENT.
+In kine the etcd revision is the row `id` (`AUTOINCREMENT`). The apiserver
+depends on three properties: **monotonic**, **no permanent gaps**, **visible in
+order**. MongoDB has no AUTOINCREMENT.
 
-## Estratégias com contador — todas ruins
+## Counter strategies — all bad
 
-Concorrência 16, 80 escritas:
+Concurrency 16, 80 writes:
 
-| Estratégia | Sucesso | Taxa | p50 | Problema |
+| Strategy | Success | Rate | p50 | Problem |
 |---|---|---|---|---|
-| A· transação, sem retry | **15/80** | 41/s | 91 ms | 81% de falha por `WriteConflict` |
-| B· transação + retry exponencial | **49/80** | 8,2/s | **870 ms** | ainda falha, e a latência colapsa |
-| C· contador atômico, sem transação | 80/80 | 37/s | 174 ms | funciona, mas 6,5× mais lento que um insert |
+| A· transaction, no retry | **15/80** | 41/s | 91 ms | 81% fail with `WriteConflict` |
+| B· transaction + exponential retry | **49/80** | 8.2/s | **870 ms** | still fails, and latency collapses |
+| C· atomic counter, no transaction | 80/80 | 37/s | 174 ms | works, but 6.5× slower than a plain insert |
 
-Todas passam por um único documento contador, que vira ponto de serialização. A "correta" (B) entrega **8,2 escritas/s** — abaixo do que um cluster de 20 nós precisa.
+All of them funnel through one counter document, which becomes a serialization
+point. The "correct" one (B) delivers **8.2 writes/s** — below what a 20-node
+cluster needs.
 
-## E o problema pior: o Change Stream não entrega em ordem de revisão
+## And the worse problem: the change stream does not deliver in revision order
 
-Com o contador, as revisões chegam no watch **fora de ordem**:
+With a counter, revisions arrive at the watch **out of order**:
 
 ```
-revisões vistas: [5, 13, 14, 9, 11, 1, 15, 7, 4, 2, 3, 12, 6, 10]
-eventos fora de ordem: 13 de 29
+revisions seen: [5, 13, 14, 9, 11, 1, 15, 7, 4, 2, 3, 12, 6, 10]
+out-of-order events: 13 of 29
 ```
 
-Faz sentido: a ordem do oplog é a ordem de **commit**, não a de aquisição do contador. Duas escritas pegam 5 e 6, e a 6 commita primeiro.
+It makes sense: the oplog's order is **commit** order, not counter-acquisition
+order. Two writes take 5 and 6, and 6 commits first.
 
-Para o kine isso é fatal — o watch precisa de ordem estrita. Exigiria um buffer de reordenação, reintroduzindo latência e complexidade justamente onde o Change Stream deveria ter simplificado.
+For kine that is fatal — the watch needs strict ordering. It would require a
+reordering buffer, reintroducing latency and complexity exactly where change
+streams were supposed to simplify.
 
-## A solução: `clusterTime` como revisão
+## The solution: `clusterTime` as the revision
 
-Em vez de inventar uma sequência, **usar a que o MongoDB já mantém**. Medido:
+Instead of inventing a sequence, **use the one MongoDB already maintains**.
+Measured:
 
-| Pergunta | Resultado |
+| Question | Result |
 |---|---|
-| A revisão é conhecida **no momento da escrita**? | ✅ `session.operation_time` após o insert |
-| É única sob concorrência? | ✅ 40 escritas concorrentes, **40 revisões distintas**, 0 duplicadas |
-| O Change Stream entrega em ordem dela? | ✅ **0 eventos fora de ordem** em 40 |
-| O `clusterTime` da escrita casa com o do evento? | ✅ **idênticos** — `Timestamp(1788730614, 7)` nos dois |
+| Is the revision known **at write time**? | ✅ `session.operation_time` after the insert |
+| Is it unique under concurrency? | ✅ 40 concurrent writes, **40 distinct revisions**, 0 duplicates |
+| Does the change stream deliver in its order? | ✅ **0 out-of-order events** in 40 |
+| Does the write's `clusterTime` match the event's? | ✅ **identical** — `Timestamp(1788730614, 7)` on both sides |
 
-Codificação para `int64`: `(ts.time << 32) | ts.inc`.
+`int64` encoding: `(ts.time << 32) | ts.inc`.
 
-**Isso elimina de uma vez:** o contador, a contenção, as transações no caminho quente, a reordenação no watch e o gap-fill. A ordem do watch passa a ser a ordem das revisões **por construção**, não por esforço.
+**This eliminates, at once:** the counter, the contention, transactions on the
+hot path, the reordering buffer and gap-fill. Watch ordering becomes the order
+of revisions **by construction**, not by effort.
 
-## O que fica em aberto
+## What was left open
 
-1. **A revisão deixa de ser densa.** Salta em vez de incrementar de 1. O etcd real incrementa; o apiserver trata `resourceVersion` como valor opaco monotônico, mas isso precisa ser validado com um k3s de verdade (`MT-3`) — e afeta `compactMinRetain`, que conta revisões.
-2. **Vida útil da codificação.** `time << 32` chega a ~7,68 × 10¹⁸ hoje; o teto do `int64` é 9,22 × 10¹⁸. A codificação estoura por volta de **2038**. Usar um epoch-base do cluster (`(time - base) << 20 | inc`) resolve com folga de séculos.
-3. **Transações continuam úteis** para compactação e outras operações raras — só não para o caminho de escrita.
+1. **Revisions stop being dense.** They jump instead of incrementing by one.
+   The apiserver treats `resourceVersion` as an opaque monotonic value, but that
+   needed validating against real k3s (`MT-3`) — and it affects
+   `compactMinRetain`, which counts revisions.
+2. **Encoding lifetime.** `time << 32` reaches ~7.68 × 10¹⁸ today against
+   `int64`'s ceiling of 9.22 × 10¹⁸ — it overflows around **2038**. Using a
+   cluster epoch base (`(time - base) << 20 | inc`) leaves centuries.
+3. **Transactions remain useful** for compaction and other rare operations —
+   just not for the write path.
 
-## Reproduzir
+## Reproduce
 
 ```bash
-spikes/mspike-4-revisoes.py [concorrencia] [total]
+spikes/mspike-4-revisoes.py [concurrency] [total]
 ```

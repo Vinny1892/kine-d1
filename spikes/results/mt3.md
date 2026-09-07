@@ -1,132 +1,111 @@
-# MT-3 — k3s real sobre o backend MongoDB
+# MT-3 — Real k3s on the MongoDB backend
 
-**Status:** ✅ **concluído** · **Data:** 2026-09-07
+**Status:** ✅ done · **Date:** 2026-09-07 · **Environment:** EC2 t3.small, Ubuntu 24.04, kernel 7.0.0-1012-aws
 
-## Contexto
+## The ordering bug, and why the first fix was expensive
 
-A primeira tentativa (feita pelo Codex, registrada em `CLAUDE.md`) falhou: o apiserver travava em `autoregister-completion` e, depois de corrigido, o scheduler e o controller-manager perdiam a eleição de líder sob a carga de bootstrap, derrubando o k3s.
+Each record is written in two operations: `InsertOne`, which supplies the
+`clusterTime` used as the revision, and `UpdateByID`, which stores it in the
+`rev` field.
 
-A causa da segunda falha era a correção da primeira. Ver abaixo.
+The original `watchLoop` discarded the insert event (`if r.Rev == 0 { continue }`)
+and waited for the **update** event. Under concurrency the inserts go out in
+order A/B but the updates may go out B/A — the watch advanced its cutoff with
+the larger revision and discarded the smaller one as already delivered. Events
+vanished, and the apiserver stalled at `autoregister-completion`.
 
-## O bug de ordenação, e por que a primeira correção custava caro
+The first fix serialized the pipeline with two mutexes (`insertMu`,
+`revisionMu`). It preserved ordering but created a queue: under k3s bootstrap
+load the wait exceeded leader election's 5-10 s deadlines, and scheduler and
+controller-manager lost their leases.
 
-Cada registro é gravado em duas operações: `InsertOne`, que fornece o `clusterTime` usado como revisão, e `UpdateByID`, que grava esse valor no campo `rev`.
+## The fix adopted: listen to inserts only
 
-O `watchLoop` original descartava o evento do insert (`if r.Rev == 0 { continue }`) e esperava o evento do **update**. Sob concorrência, os inserts saem na ordem A/B mas os updates podem sair B/A — o watch avançava o corte com a revisão maior e descartava a menor como já entregue. Eventos sumiam.
-
-A primeira correção serializou o pipeline com dois mutexes (`insertMu`, `revisionMu`). Preservava a ordem, mas criava fila: sob a carga de bootstrap do k3s, a espera ultrapassava os deadlines de 5-10 s da leader election.
-
-## A correção adotada: escutar apenas inserts
-
-O watch não precisa do campo `rev`. O evento de insert já carrega a revisão — é o `clusterTime` dele, o mesmo valor que a escrita grava — e o oplog entrega os eventos nessa ordem por construção (medido no [MSPIKE-4](mspike-4.md): zero eventos fora de ordem em 40).
+The watch does not need the `rev` field. The insert event already carries the
+revision — it is its `clusterTime`, the same value the write stores — and the
+oplog delivers events in that order by construction ([MSPIKE-4](mspike-4.md):
+zero out-of-order events in 40).
 
 ```go
-// antes: {"operationType": {"$in": ["insert","update","replace"]}} + fullDocument.rev
-// agora: {"operationType": "insert"}          + EncodeRevision(ev.clusterTime)
+// before: {"operationType": {"$in": ["insert","update","replace"]}} + fullDocument.rev
+// after:  {"operationType": "insert"}          + EncodeRevision(ev.clusterTime)
 ```
 
-Isso funciona porque o kine é um log append-only: toda mutação — criar, atualizar, apagar — insere um documento novo. O único update existente é o que grava `rev`, e ele não representa mutação nenhuma.
+This works because kine is an append-only log: every mutation — create, update,
+delete — inserts a new document. The only update that exists is the one writing
+`rev`, and it is no mutation at all.
 
-Com isso os dois mutexes saíram. O `UpdateByID` deixa de estar no caminho crítico da ordenação e passa a servir só às consultas históricas (`After`, `List`, `Get` por revisão), que leem depois do fato.
+Both mutexes went away. `UpdateByID` leaves the ordering critical path and now
+serves only historical queries, which read after the fact.
 
-**Ganho colateral:** a ordem passa a vir do oplog, que é global ao cluster MongoDB. A limitação registrada antes — "os mutexes coordenam apenas dentro de uma instância do kine" — deixa de existir: múltiplas instâncias compartilham o mesmo oplog e portanto a mesma ordem.
+**Side benefit:** ordering now comes from the oplog, which is global to the
+MongoDB cluster. The limitation recorded earlier — "the mutexes coordinate only
+within one kine instance" — ceases to exist.
 
-## Resultado
+## Why it had to leave WSL
 
-Ambiente: kine em container (`kine-mongo:fix-order`) contra o Atlas M0, k3s `rancher/k3s:latest` na mesma rede Docker, apontado por `--datastore-endpoint=http://kine-mongo-mt3:2379` (driver `remote`).
-
-| Verificação | Resultado |
-|---|---|
-| `readyz` do apiserver | ✅ **ok** em ~95 s |
-| `autoregister-completion` | ✅ **ok** (era onde travava) |
-| Lease do `kube-controller-manager` | ✅ adquirida |
-| Lease do `kube-scheduler` | ✅ adquirida |
-| Namespace + Deployment | ✅ criados |
-| ReplicaSet e Pods pelo controller-manager | ✅ 2 pods |
-| Scale 2 → 4 | ✅ 4 pods |
-| Rolling update 3.9 → 3.6 | ✅ novo ReplicaSet |
-| **Leader election sob carga (60 configmaps)** | ✅ **holders inalterados** |
-| k3s vivo ao fim | ✅ |
-
-O `readyz?verbose` passou em todos os 13 hooks.
-
-## O que NÃO foi validado
-
-**Não há nó `Ready`.** O k3s subiu com `--disable-agent`, então os pods ficam `Pending` — não há kubelet para agendá-los. O critério de aceite do MT-3 pede nó `Ready` e rolling update concluído de fato.
-
-A limitação é do ambiente, não do backend: kubelet e containerd aninhados em container privilegiado sob Docker Desktop/WSL não ficaram operacionais, e a alternativa com `--docker` esbarra no cri-dockerd esperando `/var/lib/docker` dentro do container. O diagnóstico é do Codex e continua válido.
-
-**Portanto o MT-3 continua aberto.** O que está provado é que o plano de controle inteiro — apiserver, scheduler, controller-manager, watch cache, leader election — funciona sobre o backend MongoDB e sobrevive a carga. Falta o plano de dados, e isso pede uma VM Linux com k3s instalado normalmente.
-
-## Reproduzir
-
-```bash
-docker build --target package -t kine-mongo:fix-order .
-docker run -d --name kine-mongo-mt3 --network kine-k3s-test-net kine-mongo:fix-order \
-  --endpoint "$MONGO_URI&kine_database=k3s_mt3" --listen-address 0.0.0.0:2379 --metrics-bind-address 0
-docker run -d --name k3s-mongo-mt3 --network kine-k3s-test-net --privileged \
-  --tmpfs /run --tmpfs /var/run -e K3S_TOKEN=mt3token rancher/k3s:latest server \
-  --datastore-endpoint="http://kine-mongo-mt3:2379" --disable-agent \
-  --disable traefik --disable servicelb --disable metrics-server --disable-cloud-controller
-docker exec k3s-mongo-mt3 kubectl get --raw=/readyz
-```
-
-
----
-
-# MT-3 concluído — k3s completo em EC2
-
-**Data:** 2026-09-07 · **Ambiente:** EC2 t3.small, Ubuntu 24.04, kernel 7.0.0-1012-aws, sa-east-1
-
-## Por que precisou sair do WSL
-
-As três tentativas no WSL2 travaram sempre no mesmo ponto, e a causa não era o backend:
+Three attempts on WSL2 hung at the same point, and the backend was not the
+cause:
 
 ```
-81339  D  19:03  modprobe -- iptable_nat     <- travado no kernel
+81339  D  19:03  modprobe -- iptable_nat     <- stuck in the kernel
 88567  S   6:21  modprobe -- iptable_nat
 89687  S   2:16  modprobe -- iptable_nat
 ```
 
-O primeiro `modprobe` ficou em estado **`D`** (uninterruptible sleep), travado dentro do kernel do WSL carregando `iptable_nat`. Processo em `D` não morre nem com `kill -9`, e o carregamento de módulos é serializado no kernel — então todo `modprobe` seguinte ficava preso atrás dele, e o k3s ficava em `do_wait` esperando o filho que nunca retornava. O containerd nunca subia, e o log parava em "Module br_netfilter was already loaded" sem erro.
+The first `modprobe` sat in state **`D`** — uninterruptible sleep, stuck inside
+the WSL kernel loading `iptable_nat`. A process in `D` cannot be killed even
+with `kill -9`, and module loading is serialized in the kernel, so every
+subsequent `modprobe` queued behind it while k3s waited on the child in
+`do_wait`. containerd never started, and the log stopped at "Module
+br_netfilter was already loaded" with no error.
 
-Durante todas essas tentativas o kine recebeu **duas** chamadas (`LIST /bootstrap`), respondeu `count=0` corretamente em milissegundos e ficou ocioso. O MongoDB nunca foi exercitado.
+Throughout all of that, kine received **two** calls (`LIST /bootstrap`),
+answered `count=0` correctly in milliseconds, and sat idle. MongoDB was never
+exercised.
 
-Na EC2 o mesmo módulo carrega instantaneamente.
+On EC2 the same module loads instantly.
 
-## Resultado
+## Result
 
-| Critério de aceite | Resultado |
+kine in a container (`kine-mongo:fix-order`) against Atlas M0, k3s
+`rancher/k3s:latest` on the same Docker network — and then a native k3s
+v1.36.4 on EC2.
+
+| Acceptance criterion | Result |
 |---|---|
-| Nó `Ready` | ✅ **em ~4 s** |
-| `coredns` e `local-path-provisioner` | ✅ Running |
-| Deployment com pods reais (nginx) | ✅ 4/4 Running |
+| Node `Ready` | ✅ **in ~4 s** |
+| `coredns` and `local-path-provisioner` | ✅ Running |
+| Deployment with real pods (nginx) | ✅ 4/4 Running |
 | Scale 2 → 4 | ✅ |
 | Rolling update (alpine → 1.27-alpine) | ✅ |
 | `kubectl exec` | ✅ `nginx/1.27.5` |
 | `kubectl logs` | ✅ |
-| Leader election estável | ✅ holders inalterados |
+| Leader election stable | ✅ holders unchanged |
 
-Leases adquiridas: `apiserver`, `k3s`, `k3s-cloud-controller-manager`, `kube-controller-manager`, `kube-scheduler`.
+Leases acquired: `apiserver`, `k3s`, `k3s-cloud-controller-manager`,
+`kube-controller-manager`, `kube-scheduler`.
 
-## O backend sob um cluster de verdade
-
-```
-operações atendidas:   4.866 WATCH · 82 LIST · 4 DELETE
-erros no kine:         0
-memória da máquina:    847 MB de 1.906 MB (kine + k3s + containerd + pods)
-```
-
-**Zero erros.** O volume esmagadoramente de watch confirma o desenho: com Change Streams, o custo do watch é o stream único, não uma query por segundo por watcher.
-
-## Tamanho de um cluster k3s no MongoDB
+## The backend under a real cluster
 
 ```
-842 documentos · 417 chaves distintas
-dataSize 1.729.056 bytes · storage + índices 1.052.672 bytes
+operations served:  4,866 WATCH · 82 LIST · 4 DELETE
+kine errors:        0
+machine memory:     847 MB of 1,906 MB (kine + k3s + containerd + pods)
 ```
 
-| Prefixo | Chaves |
+**Zero errors.** The overwhelmingly watch-heavy profile confirms the design:
+with change streams, the cost of watching is the single shared stream, not one
+query per second per watcher.
+
+## Size of a k3s cluster in MongoDB
+
+```
+842 documents · 417 distinct keys
+dataSize 1,729,056 bytes · storage + indexes 1,052,672 bytes
+```
+
+| Prefix | Keys |
 |---|---|
 | `/registry/events` | 108 |
 | `/registry/clusterroles` | 74 |
@@ -134,8 +113,13 @@ dataSize 1.729.056 bytes · storage + índices 1.052.672 bytes
 | `/registry/serviceaccounts` | 43 |
 | `/registry/apiregistration.k8s.io` | 23 |
 
-**Um cluster k3s inteiro ocupa ~1 MB.** Projetando os 512 MB do M0: **~429 mil documentos** — cerca de 500 clusters deste tamanho. O teto de storage, que era o gargalo mais provável, é muito mais folgado do que a estimativa do MSPIKE-7 sugeria (que usava objetos de 6 KB; os objetos reais do k3s são bem menores).
+**A whole k3s cluster is ~1 MB.** Projected onto M0's 512 MB: **~429,000
+documents**, roughly 500 clusters that size. The storage ceiling, which looked
+like the most likely bottleneck, is far more generous than the MSPIKE-7
+estimate suggested — that one used 6 KB objects, and real k3s objects are much
+smaller.
 
-## Reproduzir
+## Reproduce
 
-`hack/ec2-mt3.sh` provisiona, roda e destrói. Ver o script para a região usada.
+`hack/ec2-mt3.sh` provisions, runs and tears down. See the script for the
+region used.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Sobe o k3s como serviço systemd apontando para um kine que já esteja
-# rodando em 127.0.0.1:2399, para diagnosticar onde o bootstrap trava.
+# Starts k3s as a systemd service, pointing at a kine already
+# running on 127.0.0.1:2399, to diagnose where the bootstrap hangs.
 #
-# Diferente do k3s-mongo.sh, este script NÃO sobe o kine e NÃO mata nada no
-# fim: o cluster fica de pé para inspeção.
+# Unlike k3s-mongo.sh, this script does NOT start kine and does NOT kill
+# anything at the end: the cluster stays up for inspection.
 #
-# Uso:  sudo ./hack/k3s-diag.sh
+# Usage:  sudo ./hack/k3s-diag.sh
 set -euo pipefail
 
 KINE_ADDR="${KINE_ADDR:-127.0.0.1:2399}"
@@ -14,23 +14,23 @@ info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m ok\033[0m %s\n' "$*"; }
 die()  { printf '\033[31merro:\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "rode com sudo"
-command -v k3s >/dev/null 2>&1 || die "k3s não está instalado — rode antes o hack/k3s-mongo.sh"
+[ "$(id -u)" -eq 0 ] || die "run with sudo"
+command -v k3s >/dev/null 2>&1 || die "k3s is not installed - run hack/k3s-mongo.sh"
 
-# Um k3s órfão segura o lock e a porta 6443, e a falha resultante não aponta
-# para a causa. O k3s-killall.sh não pega instâncias iniciadas à mão.
+# An orphaned k3s holds the lock and port 6443, and the resulting failure
+# at the cause. k3s-killall.sh misses hand-started instances.
 if pgrep -f "k3s server" >/dev/null 2>&1; then
-  echo "  processos k3s já rodando:" >&2
+  echo "  k3s processes already running:" >&2
   ps -o pid,stat,etime,comm -p "$(pgrep -f 'k3s server' | tr '\n' ',' | sed 's/,$//')" >&2 2>/dev/null
-  die "derrube tudo primeiro: sudo ./hack/k3s-limpar.sh"
+  die "tear everything down first: sudo ./hack/k3s-limpar.sh"
 fi
 
-info "verificando se o kine responde em $KINE_ADDR"
+info "checking whether kine answers on $KINE_ADDR"
 timeout 5 bash -c "</dev/tcp/${KINE_ADDR/:/\/}" 2>/dev/null \
-  || die "nada escutando em $KINE_ADDR — suba o kine primeiro"
-ok "kine acessível"
+  || die "nothing listening on $KINE_ADDR — start kine first"
+ok "kine reachable"
 
-info "escrevendo /etc/rancher/k3s/config.yaml"
+info "writing /etc/rancher/k3s/config.yaml"
 mkdir -p /etc/rancher/k3s
 cat > /etc/rancher/k3s/config.yaml <<YAML
 datastore-endpoint: "http://${KINE_ADDR}"
@@ -42,25 +42,25 @@ disable:
   - metrics-server
 write-kubeconfig-mode: "644"
 YAML
-ok "config.yaml escrito"
+ok "config.yaml written"
 
-info "reiniciando o k3s pelo systemd"
+info "restarting k3s through systemd"
 systemctl daemon-reload
 systemctl restart k3s
-ok "k3s iniciado — não vou esperar nem matar nada"
+ok "k3s started - not waiting, not killing anything"
 
 cat <<'FIM'
 
-O cluster ficou de pé. Comandos úteis:
+The cluster is up. Useful commands:
 
   sudo systemctl status k3s --no-pager | head -20
-  sudo journalctl -u k3s -f                 # log ao vivo do k3s
+  sudo journalctl -u k3s -f                 # live k3s log
   sudo journalctl -u k3s --no-pager | tail -40
   sudo k3s kubectl get nodes
   sudo k3s kubectl get pods -A
 
-Para derrubar:
+To tear down:
   sudo systemctl stop k3s
-  sudo k3s-killall.sh                       # mata também containerd e pods
+  sudo k3s-killall.sh                       # also kills containerd and pods
 
 FIM

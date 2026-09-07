@@ -1,8 +1,8 @@
 name: mongo
 
 # CI do backend MongoDB. Roda contra um MongoDB de verdade em replica set —
-# não há como testar este driver sem isso: Change Streams e transações exigem
-# replica set, e são a base do desenho (ver docs/adr/).
+# there is no way to test this driver without it: change streams and
+# transactions require a replica set, and both are load-bearing (docs/adr/).
 on:
   push:
     branches: [master]
@@ -33,13 +33,13 @@ jobs:
         run: |
           arquivos=$(gofmt -l pkg/drivers/mongo test/mongo)
           if [ -n "$arquivos" ]; then
-            echo "não formatados:"; echo "$arquivos"; exit 1
+            echo "not formatted:"; echo "$arquivos"; exit 1
           fi
       - name: go vet
-        # test/mongo só tem arquivos com a tag de integração, então sem ela o
-        # pacote fica vazio e o vet reclama
+        # test/mongo only has integration-tagged files, so without the tag the
+        # package is empty and vet complains
         run: go vet ./pkg/drivers/mongo/...
-      - name: go vet (com a tag de integração)
+      - name: go vet (with the integration tag)
         run: go vet -tags=integration ./pkg/drivers/mongo/... ./test/mongo/...
 
   build:
@@ -62,8 +62,8 @@ jobs:
   testes:
     runs-on: ubuntu-latest
     services:
-      # replica set de um nó: suficiente para Change Streams e transações,
-      # que é o que o driver precisa. Um standalone não serve.
+      # single-node replica set: enough for change streams and transactions,
+      # which is what the driver needs. A standalone will not do.
       mongo:
         image: mongo:8
         ports: ['27017:27017']
@@ -78,7 +78,7 @@ jobs:
 
       - name: iniciar o replica set
         run: |
-          # A imagem oficial não sobe como replica set por padrão. Reiniciamos
+          # The official image does not start as a replica set. Restart the
           # o container com --replSet e damos rs.initiate().
           docker stop "${{ job.services.mongo.id }}"
           docker run -d --name mongo-rs -p 27017:27017 mongo:8 \
@@ -89,7 +89,7 @@ jobs:
           done
           docker exec mongo-rs mongosh --quiet --eval '
             rs.initiate({_id:"rs0", members:[{_id:0, host:"localhost:27017"}]})'
-          # espera o nó virar primary, senão as escritas falham
+          # wait for the node to become primary, or writes fail
           for i in $(seq 1 30); do
             if docker exec mongo-rs mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; then
               echo "replica set pronto"; break
@@ -104,10 +104,10 @@ jobs:
               --wildcards '*/bin/mongodump' '*/bin/mongorestore'
           mongodump --version | head -1
 
-      - name: testes unitários
+      - name: unit tests
         run: go test ./...
 
-      - name: testes de integração
+      - name: integration tests
         env:
           KINE_MONGO_TEST_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
         run: go test -tags=integration -timeout 20m ./pkg/drivers/mongo/... ./test/mongo/...

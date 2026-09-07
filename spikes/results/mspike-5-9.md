@@ -1,102 +1,124 @@
-# MSPIKE-9 + MSPIKE-5 — Modelo de documento, índices e latência
+# MSPIKE-9 + MSPIKE-5 — Document model, indexes and latency
 
-**Status:** ✅ concluído · **Data:** 2026-09-06
+**Status:** ✅ done · **Date:** 2026-09-06
 
 ## Schema
 
 ```javascript
-// coleção kine — o log de revisões
+// kine collection — the revision log
 { _id: ObjectId, rev: int64,        // rev = clusterTime (ADR-0001)
   name: str, created: bool, deleted: bool,
   create_revision: int64, prev_revision: int64, lease: int64,
-  value: BinData, old_value: BinData, expires_at: Date|null }
+  version: int64, value: BinData, old_value: BinData }
 
-// índices
-{ name: 1, rev: -1 }                  // Get da última revisão
+// indexes
+{ name: 1, rev: -1 }                  // Get of a key's latest revision
 { rev: 1 }                            // After / watch
-{ name: 1, prev_revision: 1 } UNIQUE  // detecção de chave duplicada
-{ prev_revision: 1 }                  // compactação
-{ expires_at: 1 } TTL                 // lease
+{ name: 1, prev_revision: 1 } UNIQUE  // duplicate key detection
+{ prev_revision: 1 }                  // compaction
 ```
 
-`DuplicateKeyError` (code 11000) no índice `name_prev_uniq` é mapeável direto para `server.ErrKeyExists`. Confirmado.
+`DuplicateKeyError` (code 11000) on the `name_prev_uniq` index maps directly to
+`server.ErrKeyExists`. Confirmed.
 
-## Uso de índice
+## Index usage
 
-| Query | Plano |
+| Query | Plan |
 |---|---|
-| Get: última revisão de uma chave | ✅ IXSCAN |
-| After: revisões > X | ✅ IXSCAN |
-| List: range de prefixo | ✅ IXSCAN |
-| Compact: por `prev_revision` | ✅ IXSCAN |
+| Get: a key's latest revision | ✅ IXSCAN |
+| After: revisions > X | ✅ IXSCAN |
+| List: prefix range | ✅ IXSCAN |
+| Compact: by `prev_revision` | ✅ IXSCAN |
 | **ListCurrent via `$group`** | ❌ **COLLSCAN**, 880 ms |
 
-## Latência
+## Latency
 
 | Query | p50 | p95 |
 |---|---|---|
-| Get de 1 chave | **23,4 ms** | 25,1 ms |
-| After — ocioso | **23,2 ms** | 24,1 ms |
-| CurrentRevision | 23,3 ms | 30,0 ms |
-| Count por prefixo | 23,3 ms | 24,1 ms |
-| escrita (insert + set rev) | 54,9 ms | 54,3 ms |
-| **ListCurrent (300 chaves, com value)** | **823 ms** | 1175 ms |
-| **ListCurrent (300 chaves, sem value)** | **54,6 ms** | 83,8 ms |
+| Get one key | **23.4 ms** | 25.1 ms |
+| After — idle | **23.2 ms** | 24.1 ms |
+| CurrentRevision | 23.3 ms | 30.0 ms |
+| Count by prefix | 23.3 ms | 24.1 ms |
+| write (insert + set rev) | 54.9 ms | 54.3 ms |
+| **ListCurrent (300 keys, with value)** | **823 ms** | 1175 ms |
+| **ListCurrent (300 keys, no value)** | **54.6 ms** | 83.8 ms |
 
-## O achado: o `LIST` é limitado por banda, não por índice
+## The finding: `LIST` is bandwidth-bound, not index-bound
 
-Medindo a mesma query com payloads diferentes:
+Measuring the same query with different payloads:
 
 | Volume | p50 | Throughput |
 |---|---|---|
-| 300 × 1 KB = 0,29 MB | 61 ms | 4,8 MB/s |
-| 300 × 6 KB = 1,76 MB | 269 ms | 6,5 MB/s |
-| 300 × 20 KB = 5,86 MB | 3498 ms | 1,7 MB/s |
+| 300 × 1 KB = 0.29 MB | 61 ms | 4.8 MB/s |
+| 300 × 6 KB = 1.76 MB | 269 ms | 6.5 MB/s |
+| 300 × 20 KB = 5.86 MB | 3498 ms | 1.7 MB/s |
 
-E a comparação decisiva: **sem `value` são 54,6 ms; com `value` são 823 ms — 15×**.
+And the decisive comparison: **without `value` it is 54.6 ms; with `value`,
+823 ms — 15×**.
 
-Ou seja: trocar `$group` por uma coleção materializada de estado corrente **não resolveu** (ficou em 1403 ms). O gargalo nunca foi o plano de execução, é o payload atravessando a rede.
+So replacing the `$group` aggregation with a materialised current-state
+collection **did not help** (it came out at 1403 ms). The bottleneck was never
+the execution plan, it is the payload crossing the network.
 
-Isso também explica retroativamente o D1, que media 1039 ms para as mesmas 300 chaves. **É uma característica de qualquer datastore remoto, não do MongoDB.**
+This also explains D1 retroactively, which measured 1039 ms for the same 300
+keys: **it is a property of any remote datastore**, not of MongoDB.
 
-Consequências:
-1. **`keysOnly` deixa de ser otimização e vira caminho principal.** O `server.Backend` recebe esse parâmetro; usá-lo bem é o que separa um LIST de 55 ms de um de 823 ms.
-2. Uma coleção materializada de estado corrente ainda vale — não pela latência, mas por evitar o COLLSCAN do `$group` e reduzir `rows` escaneadas.
-3. O limite de transferência do M0 (10 GB/7 dias ≈ 1,4 GB/dia) merece atenção: um LIST completo de um cluster de 500 pods move ~3 MB.
+Consequences:
 
-## Escrita: o custo do `clusterTime`
+1. **`keysOnly` stops being an optimisation and becomes the main path.**
+   `server.Backend` receives that parameter; using it well is what separates a
+   55 ms LIST from an 823 ms one.
+2. A materialised current-state collection still has merit — not for latency,
+   but to avoid the `$group` COLLSCAN.
+3. M0's transfer limit (10 GB/7 days ≈ 1.4 GB/day) deserves attention: a full
+   LIST of a 500-pod cluster moves ~3 MB.
 
-A revisão só existe **depois** do insert (`session.operation_time`), então gravá-la no documento exige uma segunda operação:
+## Writes: the cost of `clusterTime`
 
-| Estratégia | p50 |
+The revision only exists **after** the insert (`session.operation_time`), so
+storing it in the document requires a second operation:
+
+| Strategy | p50 |
 |---|---|
-| só insert (revisão não gravada) | **30,7 ms** |
-| insert + update da revisão | 59,5 ms |
-| insert + update em transação | 80,9 ms |
+| insert only (revision not stored) | **30.7 ms** |
+| insert + revision update | 59.5 ms |
+| insert + update inside a transaction | 80.9 ms |
 
-O caminho sem transação custa ~29 ms extras. Ainda é **4× melhor que os 232 ms do D1**, mas é o ponto óbvio de otimização do Épico B.
+The non-transactional path costs ~29 ms extra. Still **4× better than D1's
+232 ms**, but it is the obvious optimisation target.
 
-> Alternativa a explorar no `MFND-4`: não gravar `rev` no documento e manter o índice revisão→documento em memória, populado pelo próprio Change Stream que o watch já consome. Reduziria a escrita a uma operação (30,7 ms), ao custo de precisar reconstruir o índice no start.
+> Alternative to explore: do not store `rev` in the document at all, and keep
+> the revision→document index in memory, populated by the very change stream
+> the watch already consumes. That would reduce writes to a single operation
+> (30.7 ms), at the cost of rebuilding the index at startup.
 
-## Custo por mutação e teto
+## Cost per mutation and ceiling
 
-Medido com o ciclo completo (log histórico + coleção corrente):
-
-```
-40 mutações em 3,8s = 10,4 mutações/s
-3 ops por mutação (insert + update rev + upsert corrente)
-teto de 100 ops/s do M0 -> ~33 mutações/s
-```
-
-O modelo de fontes de write herdado do D1 estimava 3,3 writes/s ocioso e 10 em operação normal. **Cabe, com ~3× de folga.**
-
-## Storage — o teto real (MSPIKE-7)
+Measured with the full cycle (historical log + current collection):
 
 ```
-documento de 6 KB, com índices: 13.694 bytes
-512 MB / 13.694 = ~39.200 documentos
+40 mutations in 3.8s = 10.4 mutations/s
+3 ops per mutation (insert + rev update + current upsert)
+M0's 100 ops/s ceiling -> ~33 mutations/s
 ```
 
-Como o kine guarda histórico até compactar, esse é o total de **revisões vivas**. Para um cluster de 500 pods compactando a cada 5 minutos a 10 writes/s, o estado corrente mais o histórico ficam na casa de 3.500 documentos — bem dentro do teto.
+The inherited write-source model estimated 3.3 writes/s idle and 10 in normal
+operation. **It fits, with ~3× headroom.**
 
-**Mas o M0 não expande: ao encher, para.** Se a compactação atrasar, o cluster para junto. Isso torna o alerta de storage (`MOPS-1`) um requisito, não um conforto — a mesma conclusão que o D1 teve sobre o alerta de custo, por um caminho diferente.
+## Storage — the real ceiling (MSPIKE-7)
+
+```
+6 KB document, with indexes: 13,694 bytes
+512 MB / 13,694 = ~39,200 documents
+```
+
+> **Corrected by MT-3.** That estimate used synthetic 6 KB objects. A real k3s
+> cluster turned out to be 842 documents totalling **~1 MB** — about
+> **429,000 documents** in 512 MB, roughly 500 clusters that size. Real k8s
+> objects are far smaller than 6 KB, so storage is ~10× more generous than
+> projected here.
+
+**But M0 does not grow: when it fills up, it stops.** If compaction stalls, the
+cluster stalls with it. That makes the storage alert (`MOPS-1`) a requirement,
+not a comfort — the same conclusion D1 reached about its cost alert, by a
+different route.

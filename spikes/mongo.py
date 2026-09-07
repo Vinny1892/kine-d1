@@ -1,4 +1,4 @@
-"""Cliente comum dos spikes do kine-mongo. Nunca imprime credenciais."""
+"""Shared client for the kine-mongo spikes. Never prints credentials."""
 import os, sys, time
 
 ENV = os.environ.get("KINE_MONGO_ENV", os.path.expanduser("~/.config/kine-mongo/env"))
@@ -10,11 +10,11 @@ def load():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
-            # o arquivo usa aspas simples porque a URI contém "&", que o
-            # shell interpretaria como operador ao dar source
+            # the file uses single quotes because the URI contains "&", which
+            # the shell would read as an operator when sourcing
             cfg[k.strip()] = v.strip().strip("'\"")
     if not cfg.get("MONGO_URI"):
-        sys.exit(f"MONGO_URI não definido em {ENV}")
+        sys.exit(f"MONGO_URI is not set in {ENV}")
     return cfg
 
 def client(**kw):
@@ -26,8 +26,8 @@ def client(**kw):
 def db(**kw):
     return client(**kw)[DB]
 
-def cronometrar(fn, n=20, aquecer=True):
-    """Roda fn() n vezes e devolve latências ordenadas em ms."""
+def timeit(fn, n=20, aquecer=True):
+    """Runs fn() n times and returns sorted latencies in ms."""
     if aquecer:
         try: fn()
         except Exception: pass
@@ -41,10 +41,10 @@ def cronometrar(fn, n=20, aquecer=True):
 def pct(v, q):
     return v[min(int(len(v) * q), len(v) - 1)] if v else 0
 
-def resumo(rotulo, v):
+def summary(rotulo, v):
     import statistics
     print(f"  {rotulo:<34} p50={statistics.median(v):>7.1f}ms  "
           f"p95={pct(v,.95):>7.1f}ms  p99={pct(v,.99):>7.1f}ms")
 
-def titulo(t):
+def section(t):
     print(f"\n{'='*74}\n{t}\n{'='*74}")

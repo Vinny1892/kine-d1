@@ -1,31 +1,39 @@
-# MSPIKE-2 e MSPIKE-3 — Os eliminatórios do alvo M0
+# MSPIKE-2 and MSPIKE-3 — The M0 blockers
 
-**Status:** ✅ ambos passaram · **Data:** 2026-09-06
+**Status:** ✅ both passed · **Date:** 2026-09-06
 
-A documentação não afirma que Change Streams e transações faltam no M0, mas a avaliação do D1 pegou a doc da Cloudflare errada sobre limites de tamanho — então medimos.
+The documentation does not say change streams and transactions are missing on
+M0, but the D1 evaluation caught Cloudflare's docs wrong about size limits — so
+we measured.
 
-## MSPIKE-2 — Change Streams funcionam ✓
+## MSPIKE-2 — Change streams work ✓
 
-- Stream abre, com resume token disponível de imediato.
-- `insert` / `update` / `delete` chegam **na ordem**.
-- Latência do evento: **28-34 ms** (o primeiro, 190 ms, inclui o setup do stream).
-- O evento traz `clusterTime`, `fullDocument`, `documentKey` e o resume token.
+- The stream opens, with a resume token available immediately.
+- `insert` / `update` / `delete` arrive **in order**.
+- Event latency: **28-34 ms** (the first, at 190 ms, includes stream setup).
+- Events carry `clusterTime`, `fullDocument`, `documentKey` and the resume token.
 
-**Resume token sobrevive a reconexão.** Fechando o stream, escrevendo dois documentos e reabrindo com `resume_after`, os dois eventos da janela de queda foram recuperados: nenhum evento perdido.
+**The resume token survives reconnection.** Closing the stream, writing two
+documents and reopening with `resume_after` recovered both events from the gap:
+nothing lost.
 
-Isso elimina o laço de polling de 1 s (`sqllog/sql.go:486`) e, com ele, as 86.400 queries/dia que o cluster fazia parado.
+This eliminates the 1 s polling loop (`sqllog/sql.go:486`) and with it the
+86,400 queries/day an idle cluster was making.
 
-## MSPIKE-3 — Transações funcionam ✓ (mas não servem para o caminho quente)
+## MSPIKE-3 — Transactions work ✓ (but not for the hot path)
 
-Commit e rollback funcionam, inclusive revertendo o `$inc` do contador. Mas a medição de concorrência revelou o problema que motivou o MSPIKE-4:
+Commit and rollback both work, including rolling back a counter's `$inc`. But
+the concurrency measurement exposed the problem that drove MSPIKE-4:
 
 ```
-6 transações concorrentes: 2 commitaram, 4 falharam (WriteConflict)
-latência da transação: p50 76,3 ms  vs  26,6 ms de um insert simples
+6 concurrent transactions: 2 committed, 4 failed (WriteConflict)
+transaction latency: p50 76.3 ms  vs  26.6 ms for a plain insert
 ```
 
-**Transações contra um documento contador único não escalam.** Ver [MSPIKE-4](mspike-4.md) — que é onde o desenho mudou.
+**Transactions against a single counter document do not scale.** See
+[MSPIKE-4](mspike-4.md) — that is where the design changed.
 
-## Veredito
+## Verdict
 
-**O alvo M0 está de pé.** Os dois pilares existem. Mas as transações ficam reservadas para operações raras (compactação), não para o caminho de escrita.
+**The M0 target holds.** Both pillars exist. But transactions are reserved for
+rare operations (compaction), not for the write path.

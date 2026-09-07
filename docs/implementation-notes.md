@@ -94,7 +94,7 @@ discarded by the cutoff revision.
 
 ## Change stream recovery
 
-`laçoDoStream` reopens the stream when it drops, with 1 s to 30 s backoff,
+`streamLoop` reopens the stream when it drops, with 1 s to 30 s backoff,
 resuming from the resume token.
 
 When MongoDB refuses to resume — `ChangeStreamHistoryLost` (286) or

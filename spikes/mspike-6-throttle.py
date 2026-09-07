@@ -2,27 +2,27 @@
 """MSPIKE-6 — o que acontece ao estourar o teto de 100 ops/s do M0.
 
 É a premissa que justificou abandonar o Cloudflare D1: excesso de carga precisa
-virar LENTIDÃO, não fatura. Se o Atlas responder com erro em vez de throttle, a
-premissa está parcialmente errada — não vira conta caríssima, vira cluster
+become LATENCY, not an invoice. If Atlas answers with errors instead of
+queueing, the premise is partly wrong - not a huge bill, but a broken
 quebrado, e o driver precisa tratar isso.
 
-Mede também se o throttle atinge os Change Streams: se o watch parar junto, ele
-pode ficar para trás da janela do oplog (4,4h, MSPIKE-8) durante um pico.
+Also measures whether queueing reaches change streams: if the watch stalls,
+it can fall outside the oplog window (4.4h, MSPIKE-8) during a spike.
 
-Uso:  spikes/mspike-6-throttle.py [multiplicador]
+Usage:  spikes/mspike-6-throttle.py [multiplicador]
 """
 import os, sys, threading, time, statistics
 import concurrent.futures as cf
 from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mongo
-from mongo import titulo
+from mongo import section
 from pymongo.errors import OperationFailure, PyMongoError
 
 MULT = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 DB_TESTE = "kine_throttle"
 
-def fase(col, nome, alvo_ops, dur, operacao):
+def phase(col, nome, alvo_ops, dur, operacao):
     """Dispara alvo_ops por segundo durante dur segundos."""
     workers = max(8, int(alvo_ops * 0.3))
     total = int(alvo_ops * dur)
@@ -69,13 +69,13 @@ def main():
     col.drop()
     col.create_index("k")
     print(f"\nMSPIKE-6 — comportamento do M0 acima de 100 ops/s (multiplicador {MULT})")
-    print("O limite documentado do free tier é 100 operações/segundo.\n")
+    print("The documented free tier limit is 100 operations/second.\n")
 
     inserir = lambda col, i: col.insert_one({"k": i, "v": "x" * 200})
     ler     = lambda col, i: col.find_one({"k": i % 500})
 
     # ---- um watch aberto durante todo o teste, para ver se o throttle o atinge
-    titulo("Change Stream aberto antes da carga")
+    section("Change Stream aberto antes da carga")
     eventos = []
     parar = threading.Event()
     erro_cs = []
@@ -91,62 +91,62 @@ def main():
     th = threading.Thread(target=observar, daemon=True)
     th.start()
     time.sleep(3)
-    print(f"  stream aberto (erros até agora: {erro_cs or 'nenhum'})")
+    print(f"  stream opened (errors so far: {erro_cs or 'none'})")
 
-    titulo("Escalonando ESCRITA acima do teto")
+    section("Escalonando ESCRITA acima do teto")
     res = {}
     for nome, taxa, dur in [("50/s (metade)", 50, 10), ("100/s (no teto)", 100, 10),
                             ("250/s (2,5x)", 250, 10), ("600/s (6x)", 600, 10)]:
-        res[nome] = fase(col, nome, int(taxa*MULT), dur, inserir)
+        res[nome] = phase(col, nome, int(taxa*MULT), dur, inserir)
         time.sleep(2)
 
-    titulo("Escalonando LEITURA acima do teto")
+    section("Escalonando LEITURA acima do teto")
     for nome, taxa, dur in [("100/s leitura", 100, 8), ("600/s leitura", 600, 8)]:
-        res[nome] = fase(col, nome, int(taxa*MULT), dur, ler)
+        res[nome] = phase(col, nome, int(taxa*MULT), dur, ler)
         time.sleep(2)
 
-    titulo("O Change Stream sobreviveu ao pico?")
+    section("O Change Stream sobreviveu ao pico?")
     n_ev = len(eventos)
-    print(f"  eventos recebidos durante todo o teste: {n_ev:,}")
-    print(f"  erros no stream: {erro_cs or 'nenhum'}")
+    print(f"  events received durante todo o teste: {n_ev:,}")
+    print(f"  erros no stream: {erro_cs or 'none'}")
     if n_ev:
-        # o stream acompanhou ou ficou muito para trás?
+        # did the stream keep up, or fall far behind?
         atraso = time.perf_counter() - eventos[-1]
-        print(f"  último evento recebido há {atraso:.1f}s")
+        print(f"  last event received {atraso:.1f}s")
         print(f"  => {'✓ o stream continuou entregando' if atraso < 30 else '⚠ o stream parou de entregar'}")
     else:
-        print("  ⚠ nenhum evento recebido — o stream não acompanhou a carga")
+        print("  ⚠ no event received — the stream did not keep up with the load")
     parar.set()
 
-    titulo("Depois do pico: a performance volta ao normal?")
+    section("Depois do pico: a performance volta ao normal?")
     time.sleep(5)
-    recup = fase(col, "50/s pós-pico", int(50*MULT), 10, inserir)
+    recup = phase(col, "50/s post-spike", int(50*MULT), 10, inserir)
     base = res.get("50/s (metade)", {})
     if base.get("p50") and recup.get("p50"):
         fator = recup["p50"] / base["p50"]
         print(f"  p50 antes={base['p50']:.0f}ms  depois={recup['p50']:.0f}ms  ({fator:.2f}x)")
         print(f"  => {'✓ recuperou' if fator < 2 else '⚠ ainda degradado'}")
 
-    titulo("VEREDITO")
+    section("VEREDITO")
     todos_erros = Counter()
     for r in res.values():
         todos_erros.update(r["erros"])
     if not todos_erros:
-        print("  ✓ NENHUM erro em nenhuma taxa, até 6x o teto documentado.")
-        print("    O excesso virou latência, não falha — a premissa do pivot se confirma.")
+        print("  ✓ NO errors at any rate, up to 6x the documented ceiling.")
+        print("    Excess became latency, not failure - the pivot's premise holds.")
     else:
         print("  ⚠ houve erros:")
         for tipo, n in todos_erros.most_common():
             print(f"      {n}× {tipo}")
-        print("\n    Se são erros de throttle, o driver precisa tratá-los com backoff;")
-        print("    o apiserver não deve receber a falha crua.")
-    print(f"\n  latência por taxa (p50 → p99):")
+        print("\n    If these are throttling errors, the driver must handle them with backoff;")
+        print("    the apiserver must not receive the raw failure.")
+    print(f"\n  latency by rate (p50 -> p99):")
     for nome, r in res.items():
         print(f"    {nome:<18} {r['p50']:>6.0f} → {r['p99']:>7.0f} ms   ({r['real']:.0f} ops/s reais)")
 
     col.drop()
     c.drop_database(DB_TESTE)
-    print("\nlimpo")
+    print("\ncleaned up")
 
 if __name__ == "__main__":
     main()

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""MSPIKE-4 — a decisão mais importante do projeto: como gerar revisões.
+"""MSPIKE-4 — the project's most important decision: how to generate revisions.
 
-No kine a revisão do etcd é o id da linha (AUTOINCREMENT). O apiserver depende
-de três propriedades: monotônica, sem buracos permanentes, visível em ordem.
-MongoDB não tem AUTOINCREMENT.
+In kine the etcd revision is the row id (AUTOINCREMENT). The apiserver depends
+on three properties: monotonic, no permanent gaps, visible in order.
+MongoDB has no AUTOINCREMENT.
 
-O MSPIKE-3 mostrou que a abordagem óbvia — transação envolvendo um contador
-único — sofre WriteConflict sob concorrência (4 de 6 falharam) e custa 3x a
-latência de um insert simples. Este spike compara as estratégias sob carga.
+MSPIKE-3 showed the obvious approach - a transaction around a single
+counter - hits WriteConflict under concurrency (4 of 6 failed) and costs 3x
+the latency of a plain insert. This spike compares the strategies under load.
 
-Uso:  spikes/mspike-4-revisoes.py [concorrencia] [total]
+Usage:  spikes/mspike-4-revisoes.py [concorrencia] [total]
 """
 import os, sys, threading, time
 import concurrent.futures as cf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mongo
-from mongo import titulo
+from mongo import section
 from pymongo.errors import OperationFailure, ConnectionFailure
 
 CONC  = int(sys.argv[1]) if len(sys.argv) > 1 else 16
@@ -26,7 +26,7 @@ def zerar(d):
     d["rev_counters"].insert_one({"_id": "revision", "seq": 0})
     return d["rev_counters"], d["rev_kine"]
 
-def avaliar(nome, fn, c, d):
+def evaluate(nome, fn, c, d):
     rev, kv = zerar(d)
     lat, erros, ok = [], [], 0
     lock = threading.Lock()
@@ -46,8 +46,8 @@ def avaliar(nome, fn, c, d):
     dur = time.perf_counter() - t0
 
     seqs = sorted(x["rev"] for x in kv.find({}, {"rev": 1}))
-    contador = rev.find_one({"_id": "revision"})["seq"]
-    buracos = (contador - len(seqs)) if seqs else 0
+    counter = rev.find_one({"_id": "revision"})["seq"]
+    buracos = (counter - len(seqs)) if seqs else 0
     dup = len(seqs) - len(set(seqs))
     import statistics
     p50 = statistics.median(lat) if lat else 0
@@ -59,9 +59,9 @@ def avaliar(nome, fn, c, d):
         print(f"  {'':<32} erros: {dict(Counter(erros))}")
     return {"ok": ok, "taxa": TOTAL/dur, "p50": p50, "buracos": buracos, "dup": dup}
 
-# ---------------------------------------------------------------- estratégias
+# ---------------------------------------------------------------- strategies
 def a_transacao(c, rev, kv, i):
-    """Contador + insert numa transação. Correto, mas conflita."""
+    """Counter + insert in a transaction. Correct, but conflicts."""
     with c.start_session() as s:
         with s.start_transaction():
             r = rev.find_one_and_update({"_id": "revision"}, {"$inc": {"seq": 1}},
@@ -69,7 +69,7 @@ def a_transacao(c, rev, kv, i):
             kv.insert_one({"rev": r["seq"], "name": f"/registry/pods/p{i}"}, session=s)
 
 def b_transacao_retry(c, rev, kv, i, tentativas=8):
-    """A mesma, com retry em WriteConflict — o padrão recomendado pelo Mongo."""
+    """Same, retrying on WriteConflict - the pattern Mongo recommends."""
     for t in range(tentativas):
         try:
             return a_transacao(c, rev, kv, i)
@@ -81,33 +81,33 @@ def b_transacao_retry(c, rev, kv, i, tentativas=8):
     raise RuntimeError("esgotou as tentativas")
 
 def c_sem_transacao(c, rev, kv, i):
-    """findOneAndUpdate atômico + insert separado. Rápido; pode deixar buraco."""
+    """Atomic findOneAndUpdate + separate insert. Fast; may leave a gap."""
     r = rev.find_one_and_update({"_id": "revision"}, {"$inc": {"seq": 1}}, return_document=True)
     kv.insert_one({"rev": r["seq"], "name": f"/registry/pods/p{i}"})
 
 def main():
     c = mongo.client(); d = c[mongo.DB]
-    print(f"\nMSPIKE-4 — geração de revisões  (concorrência={CONC}, total={TOTAL})\n")
-    titulo("Estratégias sob concorrência")
+    print(f"\nMSPIKE-4 — revision generation  (concurrency={CONC}, total={TOTAL})\n")
+    section("Strategies under concurrency")
     res = {}
-    res["A"] = avaliar("A· transação (sem retry)", a_transacao, c, d)
-    res["B"] = avaliar("B· transação + retry", b_transacao_retry, c, d)
-    res["C"] = avaliar("C· contador atômico, sem tx", c_sem_transacao, c, d)
+    res["A"] = evaluate("A. transaction (no retry)", a_transacao, c, d)
+    res["B"] = evaluate("B. transaction + retry", b_transacao_retry, c, d)
+    res["C"] = evaluate("C. atomic counter, no tx", c_sem_transacao, c, d)
 
-    titulo("Leitura")
+    section("Leitura")
     print(f"""
-  A· transação sem retry ...... correta, mas perde {TOTAL - res['A']['ok']} de {TOTAL} escritas.
-     Inaceitável: o apiserver receberia erro.
+  A. transaction, no retry ...... correct, but loses {TOTAL - res['A']['ok']} de {TOTAL} writes.
+     Unacceptable: the apiserver would receive an error.
 
-  B· transação com retry ...... {res['B']['ok']}/{TOTAL} ok a {res['B']['taxa']:.1f}/s, p50 {res['B']['p50']:.0f}ms.
-     Correta e sem buraco, mas o retry paga o custo da contenção.
+  B. transaction with retry .... {res['B']['ok']}/{TOTAL} ok a {res['B']['taxa']:.1f}/s, p50 {res['B']['p50']:.0f}ms.
+     Correct and gap-free, but the retry pays for the contention.
 
-  C· contador sem transação ... {res['C']['ok']}/{TOTAL} ok a {res['C']['taxa']:.1f}/s, p50 {res['C']['p50']:.0f}ms.
-     {res['C']['taxa']/max(res['B']['taxa'],0.01):.1f}x mais rápida que B. O risco é buraco se o
-     insert falhar depois do $inc — e o kine já tem gap-fill para isso.
+  C. counter, no transaction ... {res['C']['ok']}/{TOTAL} ok a {res['C']['taxa']:.1f}/s, p50 {res['C']['p50']:.0f}ms.
+     {res['C']['taxa']/max(res['B']['taxa'],0.01):.1f}x faster than B. The risk is a gap if the
+     insert fails after the $inc - and kine already has gap-fill for that.
 """)
 
-    titulo("Ordem de visibilidade — as revisões aparecem em ordem no Change Stream?")
+    section("Visibility order - do revisions arrive in order on the change stream?")
     rev, kv = zerar(d)
     cs = kv.watch()
     vistos = []
@@ -124,12 +124,12 @@ def main():
         list(ex.map(lambda i: c_sem_transacao(c, rev, kv, i), range(30)))
     th.join(timeout=10)
     fora_de_ordem = sum(1 for x, y in zip(vistos, vistos[1:]) if y < x)
-    print(f"  revisões vistas: {vistos[:14]}{'…' if len(vistos)>14 else ''}")
+    print(f"  revisions seen: {vistos[:14]}{'…' if len(vistos)>14 else ''}")
     print(f"  eventos fora de ordem: {fora_de_ordem} de {max(len(vistos)-1,0)}")
-    print(f"  => {'⚠ o Change Stream NÃO garante ordem por revisão — precisa reordenar (MW-4)' if fora_de_ordem else '✓ chegaram em ordem crescente de revisão'}")
+    print(f"  => {'⚠ the change stream does NOT guarantee revision order - needs reordering (MW-4)' if fora_de_ordem else '✓ arrived in ascending revision order'}")
 
     d["rev_counters"].drop(); d["rev_kine"].drop()
-    print("\nlimpo")
+    print("\ncleaned up")
 
 if __name__ == "__main__":
     main()

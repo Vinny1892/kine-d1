@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""MSPIKE-2 e MSPIKE-3 — os dois riscos eliminatórios do alvo M0.
+"""MSPIKE-2 e MSPIKE-3 — the two blocking risks for the M0 target.
 
-MSPIKE-2: Change Streams funcionam no free tier? São o que substitui o laço de
+MSPIKE-2: Do change streams work on the free tier? They replace the
 polling de 1 s do sqllog (sql.go:486) e a principal vantagem sobre o caminho SQL.
 
-MSPIKE-3: transações multi-documento funcionam? Sem elas, seria preciso repetir
-o padrão CAS diferido que o D1 exigiu (adr-0002, arquivado).
+MSPIKE-3: Do multi-document transactions work? Without them, one would have to repeat
+the deferred CAS pattern D1 required (adr-0002, archived).
 
-A documentação não diz que faltam no M0 — mas a avaliação do D1 pegou a doc da
-Cloudflare errada sobre limites de tamanho, então medimos.
+The docs do not say they are missing on M0 - but the D1 evaluation caught
+Cloudflare's docs wrong about size limits, so we measure.
 
-Uso:  spikes/mspike-2-3-eliminatorios.py
+Usage:  spikes/mspike-2-3-eliminatorios.py
 """
 import os, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mongo
-from mongo import titulo
+from mongo import section
 
 def mspike2(c, d):
-    print("\nMSPIKE-2 — Change Streams no M0")
+    print("\nMSPIKE-2 — change streams on M0")
     col = d["cs_test"]; col.drop(); d.create_collection("cs_test")
 
-    titulo("1. Abrir um Change Stream")
+    section("1. Opening a change stream")
     try:
         cs = col.watch(full_document="updateLookup")
-        print("  ✓ stream aberto")
-        print(f"  resume token disponível: {'sim' if cs.resume_token else 'ainda não'}")
+        print("  ✓ stream opened")
+        print(f"  resume token available: {'sim' if cs.resume_token else 'not yet'}")
     except Exception as e:
-        print(f"  ✗ FALHOU: {type(e).__name__}: {str(e)[:220]}")
-        print("\n  => ELIMINATÓRIO: sem Change Streams o desenho volta ao polling.")
+        print(f"  ✗ FAILED: {type(e).__name__}: {str(e)[:220]}")
+        print("\n  => BLOCKING: without change streams the design falls back to polling.")
         return False
 
-    titulo("2. Os eventos chegam? E com que latência?")
+    section("2. Do events arrive? And with what latency?")
     recebidos = []
     def ouvir():
         try:
@@ -53,23 +53,23 @@ def mspike2(c, d):
     t.join(timeout=8)
 
     tipos = [r[0] for r in recebidos]
-    print(f"  eventos recebidos: {tipos}")
+    print(f"  events received: {tipos}")
     for op, quando, ev in recebidos:
         if op in marcos:
-            print(f"    {op:<8} latência do evento: {(quando - marcos[op])*1000:>7.1f}ms")
+            print(f"    {op:<8} event latency: {(quando - marcos[op])*1000:>7.1f}ms")
     ok2 = tipos[:3] == ["insert", "update", "delete"]
-    print(f"\n  => {'✓ insert/update/delete chegam na ordem' if ok2 else '✗ eventos faltando ou fora de ordem'}")
+    print(f"\n  => {'✓ insert/update/delete arrive in order' if ok2 else '✗ events missing or out of order'}")
 
-    titulo("3. O que vem no evento? (o kine precisa de chave, valor e ordenação)")
+    section("3. What does the event carry? (kine needs key, value and ordering)")
     if recebidos and isinstance(recebidos[0][2], dict):
         ev = recebidos[0][2]
-        print(f"  campos: {sorted(ev.keys())}")
+        print(f"  fields: {sorted(ev.keys())}")
         print(f"  clusterTime: {ev.get('clusterTime')}")
         print(f"  fullDocument: {ev.get('fullDocument')}")
         print(f"  _id (resume token): {str(ev.get('_id'))[:70]}…")
-        print("\n  => clusterTime e resume token presentes: dá para ordenar e retomar")
+        print("\n  => clusterTime and resume token present: ordering and resuming are possible")
 
-    titulo("4. Resume token — o watch sobrevive a reconexão?")
+    section("4. Resume token — does the watch survive reconnection?")
     col.drop(); d.create_collection("cs_test")
     cs2 = col.watch()
     col.insert_one({"_id": 10, "v": "antes"})
@@ -84,35 +84,35 @@ def mspike2(c, d):
         ev = next(cs3)
         perdidos.append(ev["documentKey"]["_id"])
     cs3.close()
-    print(f"  eventos recuperados após reconectar: {perdidos}")
+    print(f"  events recovered after reconnecting: {perdidos}")
     ok4 = perdidos == [11, 12]
-    print(f"  => {'✓ nenhum evento perdido na janela de queda' if ok4 else '✗ perdeu eventos'}")
+    print(f"  => {'✓ no event lost in the gap' if ok4 else '✗ lost events'}")
 
     col.drop()
     return ok2 and ok4
 
 def mspike3(c, d):
-    print("\n\nMSPIKE-3 — Transações multi-documento no M0")
+    print("\n\nMSPIKE-3 — Multi-document transactions on M0")
     rev = d["tx_counters"]; kv = d["tx_kine"]
     rev.drop(); kv.drop()
     rev.insert_one({"_id": "revision", "seq": 0})
 
-    titulo("1. Transação que COMMITA (o padrão do kine: contador + documento)")
+    section("1. Transaction that COMMITS (kine's pattern: counter + document)")
     try:
         with c.start_session() as s:
             with s.start_transaction():
                 r = rev.find_one_and_update({"_id": "revision"}, {"$inc": {"seq": 1}},
                                             return_document=True, session=s)
                 kv.insert_one({"_id": r["seq"], "name": "/registry/pods/x", "rev": r["seq"]}, session=s)
-        print(f"  ✓ commit — revisão gerada: {rev.find_one({'_id':'revision'})['seq']}, "
-              f"documentos: {kv.count_documents({})}")
+        print(f"  ✓ commit - revision generated: {rev.find_one({'_id':'revision'})['seq']}, "
+              f"documents: {kv.count_documents({})}")
         ok_commit = True
     except Exception as e:
-        print(f"  ✗ FALHOU: {type(e).__name__}: {str(e)[:260]}")
-        print("\n  => ELIMINATÓRIO: sem transações é preciso repetir o CAS diferido do D1.")
+        print(f"  ✗ FAILED: {type(e).__name__}: {str(e)[:260]}")
+        print("\n  => BLOCKING: without transactions, D1's deferred CAS has to be repeated.")
         return False
 
-    titulo("2. Transação que faz ROLLBACK")
+    section("2. Transaction that ROLLS BACK")
     antes_seq = rev.find_one({"_id": "revision"})["seq"]
     antes_n = kv.count_documents({})
     try:
@@ -121,16 +121,16 @@ def mspike3(c, d):
                 r = rev.find_one_and_update({"_id": "revision"}, {"$inc": {"seq": 1}},
                                             return_document=True, session=s)
                 kv.insert_one({"_id": r["seq"], "name": "/registry/pods/y"}, session=s)
-                raise RuntimeError("falha simulada no meio da transação")
+                raise RuntimeError("simulated failure mid-transaction")
     except RuntimeError:
         pass
     dep_seq = rev.find_one({"_id": "revision"})["seq"]
     dep_n = kv.count_documents({})
-    print(f"  contador: {antes_seq} -> {dep_seq}   documentos: {antes_n} -> {dep_n}")
+    print(f"  counter: {antes_seq} -> {dep_seq}   documents: {antes_n} -> {dep_n}")
     ok_rb = (antes_seq == dep_seq) and (antes_n == dep_n)
-    print(f"  => {'✓ ATÔMICO — o $inc também foi revertido' if ok_rb else '✗ vazou: a revisão foi consumida'}")
+    print(f"  => {'✓ ATOMIC - the $inc was rolled back too' if ok_rb else '✗ leaked: the revision was consumed'}")
 
-    titulo("3. Conflito de escrita concorrente (duas transações no mesmo documento)")
+    section("3. Concurrent write conflict (two transactions on the same document)")
     import concurrent.futures as cf
     resultados = []
     def tentar(n):
@@ -148,20 +148,20 @@ def mspike3(c, d):
         resultados = list(ex.map(tentar, range(6)))
     oks = sum(1 for r,_ in resultados if r == "ok")
     erros = [e for r,e in resultados if r == "erro"]
-    print(f"  6 transações concorrentes: {oks} commitaram, {len(erros)} falharam {set(erros) or ''}")
+    print(f"  6 concurrent transactions: {oks} committed, {len(erros)} failed {set(erros) or ''}")
     seqs = sorted(x["_id"] for x in kv.find({}, {"_id":1}))
-    print(f"  revisões geradas: {seqs}")
+    print(f"  revisions generated: {seqs}")
     sem_buraco = seqs == list(range(min(seqs), min(seqs)+len(seqs))) if seqs else False
-    print(f"  => {'✓ sem buraco na sequência' if sem_buraco else '⚠ há buracos — o gap-fill precisará tratar'}")
+    print(f"  => {'✓ no gap in the sequence' if sem_buraco else '⚠ there are gaps - gap-fill will have to handle them'}")
 
-    titulo("4. Latência da transação (contador + insert) vs insert simples")
+    section("4. Transaction latency (counter + insert) vs plain insert")
     def tx_um():
         with c.start_session() as s:
             with s.start_transaction():
                 r = rev.find_one_and_update({"_id": "revision"}, {"$inc": {"seq": 1}},
                                             return_document=True, session=s)
                 kv.insert_one({"_id": r["seq"], "name": "/lat", "v": os.urandom(6*1024)}, session=s)
-    mongo.resumo("transação (contador+insert)", mongo.cronometrar(tx_um, 20))
+    mongo.summary("transaction (counter+insert)", mongo.timeit(tx_um, 20))
 
     rev.drop(); kv.drop()
     return ok_commit and ok_rb
@@ -170,10 +170,10 @@ def main():
     c = mongo.client(); d = c[mongo.DB]
     ok2 = mspike2(c, d)
     ok3 = mspike3(c, d)
-    titulo("VEREDITO DOS ELIMINATÓRIOS")
-    print(f"  MSPIKE-2  Change Streams no M0 ......... {'✓ funcionam' if ok2 else '✗ INDISPONÍVEIS'}")
-    print(f"  MSPIKE-3  Transações no M0 ............. {'✓ funcionam' if ok3 else '✗ INDISPONÍVEIS'}")
-    print(f"\n  {'✓ O alvo M0 está de pé. O desenho da seção 3 do IDEA.md se sustenta.' if (ok2 and ok3) else '✗ O desenho precisa mudar — considerar o Flex (teto de US$ 30/mês).'}")
+    section("BLOCKING RISKS - VERDICT")
+    print(f"  MSPIKE-2  change streams on M0 ......... {'✓ work' if ok2 else '✗ UNAVAILABLE'}")
+    print(f"  MSPIKE-3  transactions on M0 ............. {'✓ work' if ok3 else '✗ UNAVAILABLE'}")
+    print(f"\n  {'✓ The M0 target holds. The design in IDEA.md section 3 stands.' if (ok2 and ok3) else '✗ The design has to change - consider Flex (US$ 30/month cap).'}")
 
 if __name__ == "__main__":
     main()

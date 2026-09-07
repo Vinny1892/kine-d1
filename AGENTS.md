@@ -1,6 +1,9 @@
 # Agent instructions
 
-- Before inspecting, editing, testing, or running this repository, always locate and read `CLAUDE.md` in full.
-- Treat the nearest `CLAUDE.md` as required repository guidance and follow it together with this file.
-- If no `CLAUDE.md` exists, explicitly report that it is missing before continuing.
+- Read `docs/implementation-notes.md` and `docs/adr/` before changing the
+  MongoDB backend. Both record decisions that are not obvious from the code,
+  including alternatives that were tried and rejected for measured reasons.
+- Design rationale belongs in `docs/`, not in code comments.
+- Never print or commit the contents of `MONGO_URI`. Credentials live in
+  `~/.config/kine-mongo/env`, outside the repository.
 - Preserve unrelated user changes in the working tree.

@@ -16,7 +16,7 @@
 | `UPDATE` que não casa | **true** | 0 |
 | `DELETE` que não casa | **true** | 0 |
 
-É a evidência independente do que motivou o [ADR-0002](../../adr-0002-transacao-diferida.md): um CAS baseado em `WHERE` não aborta nada, por isso a guarda precisa gerar erro de verdade.
+É a evidência independente do que motivou o [ADR-0002](../../adr-0002-deferred-transaction.md): um CAS baseado em `WHERE` não aborta nada, por isso a guarda precisa gerar erro de verdade.
 
 ## Achado: `hex(NULL)` é indistinguível de `hex(x'')`
 
