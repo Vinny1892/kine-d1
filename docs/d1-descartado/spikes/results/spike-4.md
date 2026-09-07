@@ -2,7 +2,7 @@
 
 **Status:** ✅ concluído · **Data:** 2026-09-06
 
-Mede as queries reais de `pkg/drivers/generic/generic.go` (com `hex()`/`unhex()` do [ADR-0001](../../docs/adr/0001-representacao-de-blob.md)) contra um D1 com 300 chaves e objetos de 6 KB — tamanho típico de objeto k8s.
+Mede as queries reais de `pkg/drivers/generic/generic.go` (com `hex()`/`unhex()` do [ADR-0001](../../adr-0001-representacao-de-blob.md)) contra um D1 com 300 chaves e objetos de 6 KB — tamanho típico de objeto k8s.
 
 ## Latência por tipo de query
 

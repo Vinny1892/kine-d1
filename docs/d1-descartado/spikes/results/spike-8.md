@@ -2,7 +2,7 @@
 
 **Status:** ✅ concluído · **Data:** 2026-09-06
 
-Aplica o schema de `pkg/drivers/sqlite/sqlite.go:25` (mais a `cas_guard` do [ADR-0002](../../docs/adr/0002-transacao-diferida.md)) e roda as queries reais do `generic` com `hex()`/`unhex()`.
+Aplica o schema de `pkg/drivers/sqlite/sqlite.go:25` (mais a `cas_guard` do [ADR-0002](../../adr-0002-transacao-diferida.md)) e roda as queries reais do `generic` com `hex()`/`unhex()`.
 
 ## Resultados
 

@@ -1,200 +1,240 @@
-# Backend MongoDB para o kine
+# MongoDB backend for kine
 
-Roda um cluster Kubernetes (k3s) usando **MongoDB** como datastore, no lugar do etcd.
+Runs a Kubernetes cluster (k3s) with **MongoDB** as the datastore instead of
+etcd.
 
-> **Estado:** v0.1 — validado com um k3s real (nó `Ready`, deployment, scale, rolling update, `kubectl exec`/`logs`). Não é para produção crítica; leia [Quando não usar](#quando-não-usar).
+> **Status:** v0.2 — validated against a real k3s cluster (node `Ready`,
+> deployment, scale, rolling update, `kubectl exec`/`logs`), with parity,
+> conformance, load and chaos coverage. Not for critical production; read
+> [When not to use it](#when-not-to-use-it).
+
+**New here?** Start with the [k3s tutorial](k3s-tutorial.md). This page is the
+reference.
 
 ---
 
-## Como funciona
+## How it works
 
-O kine traduz a API etcd v3 que o `kube-apiserver` fala para o datastore de baixo. Os drivers SQL (SQLite, PostgreSQL, MySQL) compartilham a interface `server.Dialect`, que devolve `*sql.Rows`. MongoDB não fala SQL, então este driver implementa `server.Backend` diretamente — como fazem os drivers `nats` e `t4`.
+kine translates the etcd v3 API that `kube-apiserver` speaks into the
+underlying datastore. The SQL drivers (SQLite, PostgreSQL, MySQL) share the
+`server.Dialect` interface, which returns `*sql.Rows`. MongoDB does not speak
+SQL, so this driver implements `server.Backend` directly — the same path the
+`nats` and `t4` drivers take.
 
-Duas decisões moldam o resto, e ambas têm ADR:
+Two decisions shape everything else, and both have an ADR:
 
-| Decisão | Por quê | ADR |
+| Decision | Why | ADR |
 |---|---|---|
-| A revisão do etcd é o **`clusterTime`** do MongoDB, não um contador | Um contador sofre `WriteConflict` sob concorrência (8,2 escritas/s) e o Change Stream entrega fora da ordem dele | [ADR-0001](adr/0001-revisao-por-clustertime.md) |
-| O watch escuta só `insert` e deriva a revisão do **`clusterTime` do evento** | Esperar o update que grava `rev` fazia eventos desaparecerem e travava o apiserver | [ADR-0002](adr/0002-watch-por-clustertime-do-insert.md) |
+| The etcd revision **is** MongoDB's `clusterTime`, not a counter | A counter hits `WriteConflict` under concurrency (8.2 writes/s) and the change stream delivers out of its order | [ADR-0001](adr/0001-revision-from-clustertime.md) |
+| The watch listens to `insert` only, deriving the revision from the event's `clusterTime` | Waiting for the update that writes `rev` made events disappear and stalled the apiserver | [ADR-0002](adr/0002-watch-listens-to-inserts.md) |
 
-O watch usa **Change Streams**, não polling. Os drivers SQL rodam uma query por segundo para sempre; aqui existe **um único stream por processo**, compartilhado por todos os watchers via `pkg/broadcaster`.
-
----
-
-## Requisitos
-
-- **MongoDB como replica set.** Change Streams e transações exigem isso. O Atlas M0 (free) serve — é um replica set de 3 nós.
-- Um usuário com `readWrite` no banco escolhido.
-
-Não funciona em MongoDB standalone.
+The watch uses **change streams**, not polling. SQL drivers run one query per
+second forever; here there is **a single stream per process**, shared by every
+watcher through `pkg/broadcaster`.
 
 ---
 
-## Uso
+## Requirements
+
+- **MongoDB as a replica set.** Change streams and transactions require it.
+  Atlas M0 (free) qualifies — it is a 3-node replica set.
+- A user with `readWrite` on the chosen database.
+
+A standalone `mongod` will not work.
+
+---
+
+## Usage
 
 ```bash
-kine --endpoint "mongodb+srv://usuario:senha@cluster.exemplo.mongodb.net/?retryWrites=true&w=majority"
+kine --endpoint "mongodb+srv://user:password@cluster.example.mongodb.net/?retryWrites=true&w=majority"
 ```
 
-E no k3s, apontando para um kine já em execução:
+And in k3s, pointing at a running kine:
 
 ```bash
-k3s server --datastore-endpoint="http://127.0.0.1:2399"
+k3s server --datastore-endpoint="http://127.0.0.1:2379"
 ```
 
-### Parâmetros da DSN
+### DSN parameters
 
-A connection string é a do MongoDB. Parâmetros extras usam o prefixo `kine_` e são removidos antes de repassar a URI ao driver oficial, que rejeita chaves desconhecidas.
+The connection string is MongoDB's own. Extra parameters use the `kine_`
+prefix and are stripped before the URI reaches the official driver, which
+rejects unknown keys.
 
-| Parâmetro | Default | Para quê |
+| Parameter | Default | Purpose |
 |---|---|---|
-| `kine_database` | `kine` | Banco onde as coleções vivem. Também aceito no caminho da URI |
-| `kine_collection` | `kine` | Coleção do log de revisões |
-| `kine_epoch_base` | `1767225600` | Instante a partir do qual as revisões são contadas — **ver abaixo** |
-| `kine_connect_timeout` | `30s` | Timeout da conexão inicial |
-| `kine_server_selection_timeout` | `30s` | Espera por um servidor elegível |
+| `kine_database` | `kine` | Database holding the collections. Also accepted in the URI path |
+| `kine_collection` | `kine` | Revision log collection |
+| `kine_epoch_base` | `1767225600` | Instant revisions are counted from — **see below** |
+| `kine_connect_timeout` | `30s` | Initial connection timeout |
+| `kine_server_selection_timeout` | `30s` | How long to wait for an eligible server |
 
-**Sobre o `kine_epoch_base`:** a revisão é `(clusterTime.T - epochBase) << 20 | clusterTime.I`. Sem a subtração, o deslocamento estoura o `int64` por volta de 2038. O valor é gravado nos metadados na primeira execução e **não pode mudar depois** — alterá-lo reescreveria o significado de toda revisão já entregue ao apiserver. O driver recusa iniciar se a DSN pedir um valor diferente do gravado.
+**About `kine_epoch_base`:** the revision is
+`(clusterTime.T - epochBase) << 20 | clusterTime.I`. Without the subtraction
+the shift overflows `int64` around 2038. The value is written to metadata on
+first run and **cannot change afterwards** — changing it would rewrite the
+meaning of every revision already handed to the apiserver. The driver refuses
+to start if the DSN asks for a value different from the stored one.
 
-`writeConcern` e `readConcern` são fixados em `majority`: o kine precisa ler a revisão que acabou de gravar. Medido — custa 26,6 ms contra 27,2 ms do write default, diferença indistinguível.
+`writeConcern` and `readConcern` are pinned to `majority`: kine must read the
+revision it just wrote. Measured — 26.6 ms versus 27.2 ms for a default write,
+an indistinguishable difference.
 
 ---
 
-## Coleções criadas
+## Collections
 
-| Coleção | Conteúdo |
+| Collection | Contents |
 |---|---|
-| `kine` | o log de revisões (uma entrada por mutação) |
-| `kine_meta` | epoch base e revisão compactada do cluster |
+| `kine` | the revision log (one entry per mutation) |
+| `kine_meta` | cluster epoch base and compacted revision |
 
-Índices em `kine`: `(name, rev)`, `(rev)`, `(name, prev_revision)` **único**, `(prev_revision)`. O índice único é o que produz o `ErrKeyExists` do etcd quando dois clientes criam a mesma chave.
-
----
-
-## Setup no Atlas (free tier)
-
-1. Crie um cluster **M0**. Prefira a região mais próxima de onde o kine vai rodar — a latência de escrita entra direto no caminho da leader election.
-2. Crie um usuário de banco com `readWrite`.
-3. Em **Network Access**, libere o IP de onde o kine roda.
-4. Pegue a connection string em **Connect → Drivers**.
-
-Guarde a credencial fora do repositório. Nos scripts deste projeto ela vive em `~/.config/kine-mongo/env`:
-
-```bash
-MONGO_URI='mongodb+srv://usuario:senha@cluster.exemplo.mongodb.net/?retryWrites=true&w=majority'
-```
-
-As aspas simples importam: a URI contém `&`, que o shell interpretaria como operador ao dar `source`.
+Indexes on `kine`: `(name, rev)`, `(rev)`, `(name, prev_revision)` **unique**,
+`(prev_revision)`. The unique index is what produces etcd's `ErrKeyExists` when
+two clients create the same key.
 
 ---
 
-## O que foi medido
+## What was measured
 
-Contra um Atlas M0 em São Paulo, e um k3s v1.36.4 real em EC2:
+Against an Atlas M0 in São Paulo, and a real k3s v1.36.4 on EC2:
 
 | | |
 |---|---|
-| Latência de escrita (`insert` w=majority) | **26,6 ms** p50 |
-| Latência de leitura (`find` por índice) | **21,9 ms** p50 |
-| Nó `Ready` | **~4 s** |
-| `readyz` do apiserver | **~30 s** |
-| Operações num bootstrap completo | 4.866 WATCH · 82 LIST · 4 DELETE · **0 erros** |
-| Tamanho de um cluster k3s inteiro | **~1 MB** (842 documentos) |
-| Latência vista pelo apiserver, 1 escrita por vez | **~87 ms** p50 |
-| Latência vista pelo apiserver, 12 escritas concorrentes | **~884 ms** p50 |
-| Projeção nos 512 MB do M0 | **~429 mil documentos** |
-| Janela do oplog no M0 | **~4,4 h** |
-| Teto real de escrita (M0) | **~92 ops/s** — acima disso a latência explode |
-| Teto prático de mutações do cluster | **~30/s** (cada mutação custa ~2 ops) |
+| Write latency (`insert`, w=majority) | **26.6 ms** p50 |
+| Read latency (`find` by index) | **21.9 ms** p50 |
+| Node `Ready` | **~4 s** |
+| apiserver `readyz` | **~30 s** |
+| Operations during a full bootstrap | 4,866 WATCH · 82 LIST · 4 DELETE · **0 errors** |
+| A whole k3s cluster | **~1 MB** (842 documents) |
+| Projected onto M0's 512 MB | **~429,000 documents** |
+| Oplog window on M0 | **~4.4 h** |
+| Real write ceiling (M0) | **~92 ops/s** — beyond that, latency explodes |
+| Practical cluster mutation ceiling | **~30/s** (each mutation costs ~2 ops) |
+| Latency the apiserver sees, one write at a time | **~87 ms** p50 |
+| Latency the apiserver sees, 12 concurrent writes | **~884 ms** p50 |
 
-Detalhes e como reproduzir em [`spikes/results/`](../spikes/results/).
+Details and reproduction steps in [`spikes/results/`](../spikes/results/).
 
 ---
 
-## Capacidade e o que monitorar
+## Capacity and what to monitor
 
-O teto do M0 é **~92 operações/s de escrita**. Cada mutação do kine custa ~2 operações (o insert e o update que grava a revisão), então:
+M0's ceiling is **~92 write operations/s**. Each kine mutation costs ~2
+operations (the insert, and the update that writes the revision), so:
 
-| | Mutações/s do cluster |
+| | Cluster mutations/s |
 |---|---|
-| Teto absoluto | ~45 |
-| **Onde a latência ainda é sadia** | **~30** |
-| Cluster médio ocioso | 3,3 |
-| Cluster médio em operação | 10 |
+| Absolute ceiling | ~45 |
+| **Where latency is still healthy** | **~30** |
+| Medium cluster, idle | 3.3 |
+| Medium cluster, in operation | 10 |
 
-Folga de 3× a 9× para um cluster médio — suficiente, não confortável.
+Three to nine times headroom for a medium cluster — enough, not comfortable.
 
-**O que estourar o teto faz não é falhar; é ficar lento.** Medido em [MSPIKE-6](../spikes/results/mspike-6.md): zero erros até 6× o teto, mas o p99 de escrita sai de 810 ms para **63 s**, e o change stream fica **44 s atrasado**. Para o Kubernetes isso é pior que um erro: a leader election tem `RenewDeadline` de 10 s, então scheduler e controller-manager perdem a liderança sem que nada no log diga por quê.
+**Exceeding the ceiling does not fail; it gets slow.** Measured in
+[MSPIKE-6](../spikes/results/mspike-6.md): zero errors at 6× the ceiling, but
+write p99 went from 810 ms to **63 s**, and the change stream fell **44 s**
+behind. For Kubernetes that is worse than an error: leader election has a 10 s
+`RenewDeadline`, so scheduler and controller-manager lose leadership with
+nothing in the logs to explain it.
 
-Por isso, o que monitorar **não é taxa de erro** — não vai haver erro:
+So what to monitor is **not error rate** — there will not be any:
 
-| Sinal | Alerta |
+| Signal | Alert when |
 |---|---|
-| **Latência de escrita p99** | acima de ~1 s, o cluster está a caminho de perder a liderança |
-| **Concorrência de escrita** | é ela que dói, não o volume: 1 escrita por vez custa ~87 ms; 12 simultâneas custam ~884 ms ([MT-4](../spikes/results/mt-1-2-4-5.md)) |
-| **Atraso do change stream** | acima de alguns segundos, os informers estão obsoletos |
-| Storage usado | o M0 não expande; ao encher, o cluster para |
+| **Write latency p99** | above ~1 s, the cluster is heading toward losing leadership |
+| **Change stream lag** | above a few seconds, informers are going stale |
+| **Write concurrency** | this is what hurts, not volume: one write at a time costs ~87 ms; twelve at once cost ~884 ms |
+| Storage used | M0 does not grow; when full, the cluster stops |
 
-As métricas expostas pelo driver, todas com prefixo `kine_mongo_`:
+Metrics exposed by the driver, all prefixed `kine_mongo_`:
 
-| Métrica | |
+| Metric | |
 |---|---|
-| `ops_total{op,result}` | contagem por operação |
-| `op_duration_seconds{op}` | histograma, buckets de 1 ms a ~16 s |
-| **`change_stream_lag_seconds`** | idade do último evento — **a que detecta o modo de falha real** |
+| `ops_total{op,result}` | count per operation |
+| `op_duration_seconds{op}` | histogram, buckets from 1 ms to ~16 s |
+| **`change_stream_lag_seconds`** | age of the last event — **the one that catches the real failure mode** |
 | `change_stream_reconnects_total{motivo}` | `queda`, `historico_perdido`, `falha_ao_abrir` |
 | `storage_bytes{componente}` | `dados`, `storage`, `indices` |
-| `current_revision`, `compacted_revision` | posição do log |
-
-## Quando não usar
-
-Seja honesto sobre o que isso é.
-
-**Não use se:**
-
-- **É produção crítica.** Este driver é novo, não tem uso em campo, e não passou pela suíte de conformidade etcd completa (`MT-2`).
-- **O cluster tem muito churn** — CI criando milhares de Jobs, operadores com reconcile agressivo. O teto é ~30 mutações/s antes da latência machucar a leader election ([MSPIKE-6](../spikes/results/mspike-6.md)), e o sintoma de estourar é o cluster travando sem mensagem de erro.
-- **A latência importa.** Cada operação do apiserver paga a ida e volta até o MongoDB. Com o banco longe, isso vira dezenas ou centenas de milissegundos, e a leader election tem deadlines de 5-10 s.
-- **Você precisa de backup automático no M0.** O free tier não tem; só `mongodump` manual — runbook em [backup-restore.md](backup-restore.md).
-- **Não pode usar replica set.** Standalone não serve.
-
-**Faz sentido para:** homelab, borda, dev/staging, clusters pequenos onde "não administrar banco" vale mais que milissegundos, e onde o Atlas já é parte da stack.
-
-### Riscos conhecidos
-
-| Risco | Situação |
-|---|---|
-| Watch fica para trás da janela do oplog (~4,4 h no M0) e invalida | Tratado: o driver detecta `ChangeStreamHistoryLost` e recupera por leitura direta ([MW-3](../spikes/results/mt3.md)) |
-| M0 não expande storage — ao encher, o cluster para | Folga grande (~429 mil documentos), mas **sem alerta ainda** (`MOPS-1` aberto) |
-| Teto de 100 ops/s no M0 | **Medido** ([MSPIKE-6](../spikes/results/mspike-6.md)): não gera erro, gera latência. p99 vai a **63 s** a 6× o teto — e a leader election tem deadline de 10 s |
-| Change stream fica para trás sob carga | **Medido**: 44 s de atraso a 6× o teto, sem perder evento. Um watch atrasado é um cluster que não vê suas mudanças |
-| Revisões não são densas — saltam | Por desenho ([ADR-0001](adr/0001-revisao-por-clustertime.md)). O apiserver trata `resourceVersion` como valor opaco; validado com k3s real |
-| Órfão com `rev = 0` se o processo morrer entre insert e update | Inerte, não corrompe estado ([ADR-0002](adr/0002-watch-por-clustertime-do-insert.md)) |
+| `current_revision`, `compacted_revision` | log position |
 
 ---
 
-## Desenvolvimento
+## When not to use it
+
+Be honest about what this is.
+
+**Do not use it if:**
+
+- **It is critical production.** This driver is new, has no field usage, and
+  while it passes an etcd conformance suite written against the patterns the
+  apiserver emits, it has not run for weeks under unpredictable load.
+- **The cluster has heavy churn** — CI creating thousands of Jobs, operators
+  with aggressive reconcile loops. The ceiling is ~30 mutations/s before
+  latency hurts leader election
+  ([MSPIKE-6](../spikes/results/mspike-6.md)), and the symptom of exceeding it
+  is the cluster stalling with no error message.
+- **Latency matters.** Every apiserver operation pays a round trip to MongoDB.
+  With the database far away that becomes tens or hundreds of milliseconds,
+  and leader election deadlines are 5-10 s.
+- **You need automatic backups on M0.** The free tier has none — only manual
+  `mongodump`, with a runbook in [backup-restore.md](backup-restore.md).
+- **You cannot use a replica set.** Standalone will not work.
+
+**It makes sense for:** homelab, edge, dev/staging, small clusters where "not
+administering a database" is worth more than milliseconds, and where Atlas is
+already part of the stack.
+
+### Known risks
+
+| Risk | Status |
+|---|---|
+| Watch falls outside the oplog window (~4.4 h on M0) and gets invalidated | Handled: the driver detects `ChangeStreamHistoryLost` and backfills by reading the collection ([MW-3](../spikes/results/mt3.md)) |
+| M0 does not grow storage — when full, the cluster stops | Large headroom (~429,000 documents), and `kine_mongo_storage_bytes` exposes it |
+| Operation ceiling on M0 | **Measured** ([MSPIKE-6](../spikes/results/mspike-6.md)): no errors, just latency. p99 reaches **63 s** at 6× the ceiling — and leader election has a 10 s deadline |
+| Change stream falls behind under load | **Measured**: 44 s lag at 6× the ceiling, without losing events. A lagging watch is a cluster blind to its own changes |
+| Revisions are not dense — they jump | By design ([ADR-0001](adr/0001-revision-from-clustertime.md)). The apiserver treats `resourceVersion` as opaque; validated against real k3s |
+| Orphan with `rev = 0` if the process dies between insert and update | Inert, does not corrupt state ([ADR-0002](adr/0002-watch-listens-to-inserts.md)) |
+
+---
+
+## Development
 
 ```bash
 go build ./...
-go test ./...                                    # unitários, sem credencial
+go test ./...                                    # unit tests, no credentials
 
-export KINE_MONGO_TEST_URI="mongodb+srv://..."   # integração contra Mongo real
+export KINE_MONGO_TEST_URI="mongodb+srv://..."   # integration, real MongoDB
 go test -tags=integration ./pkg/drivers/mongo/ ./test/mongo/
 ```
 
-Os testes de integração criam uma coleção própria por execução e a removem no fim. `test/mongo/` exercita o backend pelo **protocolo etcd v3 real** — inclusive `Txn` com `Compare(ModRevision)`, que é como o apiserver faz concorrência otimista.
+Integration tests create their own collection per run and drop it afterwards.
+`test/mongo/` exercises the backend through the **real etcd v3 protocol** —
+including `Txn` with `Compare(ModRevision)`, which is how the apiserver
+implements optimistic concurrency.
+
+One trap worth knowing if you write tests against kine: `Txn` is not generic.
+kine recognizes a closed set of shapes by exact form
+(`pkg/server/limited.go:29`) — a conditional delete, for instance, requires an
+`Else` branch containing a `Range` (`pkg/server/delete.go:19`).
 
 ### Scripts
 
-| Script | Para quê |
+| Script | Purpose |
 |---|---|
-| `hack/ec2-mt3.sh criar` / `destruir` | Provisiona uma EC2, roda o teste de k3s completo, destrói |
-| `hack/k3s-mongo.sh` | Sobe kine + k3s localmente (precisa Linux de verdade — ver abaixo) |
-| `hack/k3s-diag.sh` | Sobe só o k3s contra um kine já em execução, sem matar nada no fim |
-| `hack/k3s-limpar.sh` | Derruba tudo do k3s, inclusive instâncias órfãs |
-| `spikes/*.py` | As medições, reproduzíveis |
+| `hack/ec2-mt3.sh criar` / `destruir` | Provisions an EC2 instance, runs the full k3s test, tears it down |
+| `hack/k3s-mongo.sh` | Brings up kine + k3s locally (needs real Linux — see below) |
+| `hack/k3s-diag.sh` | Starts only k3s against a running kine, leaving everything up for inspection |
+| `hack/k3s-limpar.sh` | Tears down everything k3s, including orphaned instances |
+| `hack/k3s-estado.sh` | Collects k3s state, including what requires root |
+| `spikes/*.py` | The measurements, reproducible |
 
-Backup e restore: [docs/backup-restore.md](backup-restore.md) — o M0 não tem backup automático.
+**Do not try this on WSL2.** `modprobe iptable_nat` hangs in `D` state
+(uninterruptible) inside the WSL kernel, immune to `kill -9`. Since module
+loading is serialized in the kernel, every subsequent `modprobe` queues behind
+it and k3s waits forever — without logging an error. Use `hack/ec2-mt3.sh` or
+a VM.
 
-**Não tente no WSL2.** O `modprobe iptable_nat` trava em estado `D` (uninterruptible) dentro do kernel do WSL, imune a `kill -9`. Como o carregamento de módulos é serializado, todo `modprobe` seguinte fica preso atrás dele e o k3s espera para sempre — sem gerar erro no log. Use `hack/ec2-mt3.sh` ou uma VM.
+Backup and restore: [backup-restore.md](backup-restore.md).

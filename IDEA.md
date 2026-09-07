@@ -113,7 +113,7 @@ Isso é atômico, mas cria três problemas que precisam de spike:
 >
 > As três variantes com contador foram medidas sob concorrência 16. A correta (transação com retry) entrega **8,2 escritas/s** com p50 de 870 ms — abaixo do que um cluster de 20 nós precisa. E o problema decisivo é outro: com contador, **o Change Stream entrega as revisões fora de ordem** (13 de 29 eventos), porque a ordem do oplog é a de commit, não a de aquisição do contador.
 >
-> **A decisão é usar o `clusterTime` do MongoDB como revisão** ([ADR-0001](docs/adr/0001-revisao-por-clustertime.md)). Medido: conhecida na escrita via `session.operation_time`, única sob concorrência (40/40 distintas), e o Change Stream entrega **em ordem dela** — zero eventos fora de ordem. A escrita e o evento carregam o mesmo `clusterTime`.
+> **A decisão é usar o `clusterTime` do MongoDB como revisão** ([ADR-0001](docs/adr/0001-revision-from-clustertime.md)). Medido: conhecida na escrita via `session.operation_time`, única sob concorrência (40/40 distintas), e o Change Stream entrega **em ordem dela** — zero eventos fora de ordem. A escrita e o evento carregam o mesmo `clusterTime`.
 >
 > O contador inventa uma ordem que compete com a do banco; o `clusterTime` **é** a ordem do banco. Isso elimina de uma vez o contador, a contenção, as transações no caminho quente, o buffer de reordenação e o gap-fill.
 
@@ -177,7 +177,7 @@ Não há atalho: revisões, watch, compactação, gap-fill e lease. O `pkg/drive
 
 ### 6.3 ✅ ~~Sequência de revisões~~ — RESOLVIDO pelo MSPIKE-4
 
-Contenção, buracos e ordem fora de sequência eram todos consequência do contador. Com `clusterTime` ([ADR-0001](docs/adr/0001-revisao-por-clustertime.md)) os três desaparecem.
+Contenção, buracos e ordem fora de sequência eram todos consequência do contador. Com `clusterTime` ([ADR-0001](docs/adr/0001-revision-from-clustertime.md)) os três desaparecem.
 
 Sobra uma consequência a validar: **a revisão deixa de ser densa** — salta em vez de incrementar de 1. O apiserver trata `resourceVersion` como valor opaco monotônico, mas isso precisa ser confirmado com um k3s real (`MT-3`). Afeta também o `compactMinRetain`, que conta revisões e passará a ser uma janela de tempo.
 

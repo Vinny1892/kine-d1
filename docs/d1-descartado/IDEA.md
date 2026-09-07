@@ -196,7 +196,7 @@ Ordenados por gravidade. Cada um vira um *spike* na seção 6.
 
 O D1 rejeita `BEGIN TRANSACTION`/`SAVEPOINT`; só existe `batch`, atômico mas não interativo. O `sqllog` abre transações serializáveis em dois lugares (`sql.go:91` e `sql.go:234`) com leituras e escritas intercaladas.
 
-**Solução validada:** transação diferida com CAS — leituras em autocommit, escritas num buffer, `Commit()` envia um `batch` precedido de uma guarda que aborta se o estado mudou. Desenho completo no [ADR-0002](docs/adr/0002-transacao-diferida.md); medições em [`spikes/results/spike-6.md`](spikes/results/spike-6.md).
+**Solução validada:** transação diferida com CAS — leituras em autocommit, escritas num buffer, `Commit()` envia um `batch` precedido de uma guarda que aborta se o estado mudou. Desenho completo no [ADR-0002](adr-0002-transacao-diferida.md); medições em [`spikes/results/spike-6.md`](spikes/results/spike-6.md).
 
 Os quatro critérios foram medidos contra um D1 real: batch atômico ✓ · guarda que aborta ✓ · compact protegido ✓ · duas instâncias concorrentes, exatamente uma vence ✓.
 
@@ -231,7 +231,7 @@ A compressão (`DRV-6`) continua valendo, agora como folga extra e economia, nã
 
 ### 5.4 ✅ ~~BLOBs sobre JSON~~ — RESOLVIDO pelo SPIKE-3
 
-Quatro estratégias fazem round-trip byte a byte; a decisão está no [ADR-0001](docs/adr/0001-representacao-de-blob.md).
+Quatro estratégias fazem round-trip byte a byte; a decisão está no [ADR-0001](adr-0001-representacao-de-blob.md).
 
 **Escolhido: hex + `unhex()` → BLOB nativo**, com compressão por cima. Armazenamento 1:1 (contra 1,33× do base64) é o que preserva a margem de 28% no pior caso. O custo é 2× no transporte, mas em objetos k8s típicos de 5-10 KB a diferença medida foi ruído — 226 ms contra 225 ms.
 

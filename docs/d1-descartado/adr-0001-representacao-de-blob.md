@@ -1,6 +1,6 @@
 # ADR-0001 — Representação de BLOB sobre a REST API do D1
 
-**Status:** aceito · **Data:** 2026-09-06 · **Evidência:** [SPIKE-3](../../spikes/results/spike-3.md)
+**Status:** aceito · **Data:** 2026-09-06 · **Evidência:** [SPIKE-3](spikes/results/spike-3.md)
 
 ## Contexto
 

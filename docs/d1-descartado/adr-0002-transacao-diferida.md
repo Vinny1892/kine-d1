@@ -1,6 +1,6 @@
 # ADR-0002 — Transação diferida com CAS no lugar de `BEGIN TRANSACTION`
 
-**Status:** aceito · **Data:** 2026-09-06 · **Evidência:** [SPIKE-6](../../spikes/results/spike-6.md)
+**Status:** aceito · **Data:** 2026-09-06 · **Evidência:** [SPIKE-6](spikes/results/spike-6.md)
 
 ## Contexto
 

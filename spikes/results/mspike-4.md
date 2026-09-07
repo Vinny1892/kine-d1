@@ -1,6 +1,6 @@
 # MSPIKE-4 — Como gerar revisões: o desenho mudou
 
-**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0001](../../docs/adr/0001-revisao-por-clustertime.md)
+**Status:** ✅ concluído · **Data:** 2026-09-06 · **Decisão:** [ADR-0001](../../docs/adr/0001-revision-from-clustertime.md)
 
 ## O problema
 
