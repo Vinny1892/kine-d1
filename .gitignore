@@ -77,3 +77,7 @@ spikes/**/*.local.*
 
 # kine-mongo: credenciais e binários locais
 /kine
+
+# python dos spikes
+__pycache__/
+*.pyc
