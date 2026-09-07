@@ -107,6 +107,7 @@ func (r *Record) toKV() *server.KeyValue {
 	return &server.KeyValue{
 		Key:            r.Name,
 		Value:          r.Value,
+		Version:        r.Version,
 		CreateRevision: r.CreateRevision,
 		ModRevision:    r.Rev,
 		Lease:          r.Lease,
@@ -168,6 +169,7 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 		PrevRevision: prev,
 		Lease:        lease,
 		Value:        value,
+		Version:      1,
 	})
 	if mongo.IsDuplicateKeyError(err) {
 		return 0, server.ErrKeyExists
@@ -198,6 +200,7 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		Lease:          lease,
 		Value:          value,
 		OldValue:       cur.Value,
+		Version:        cur.Version + 1,
 	}
 	newRev, err := b.append(ctx, novo)
 	if mongo.IsDuplicateKeyError(err) {
@@ -233,6 +236,7 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 		PrevRevision:   cur.Rev,
 		Lease:          cur.Lease,
 		OldValue:       cur.Value,
+		Version:        cur.Version + 1,
 	}
 	if _, err := b.append(ctx, tomb); err != nil {
 		if mongo.IsDuplicateKeyError(err) {

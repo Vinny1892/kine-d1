@@ -100,6 +100,8 @@ Contra um Atlas M0 em São Paulo, e um k3s v1.36.4 real em EC2:
 | `readyz` do apiserver | **~30 s** |
 | Operações num bootstrap completo | 4.866 WATCH · 82 LIST · 4 DELETE · **0 erros** |
 | Tamanho de um cluster k3s inteiro | **~1 MB** (842 documentos) |
+| Latência vista pelo apiserver, 1 escrita por vez | **~87 ms** p50 |
+| Latência vista pelo apiserver, 12 escritas concorrentes | **~884 ms** p50 |
 | Projeção nos 512 MB do M0 | **~429 mil documentos** |
 | Janela do oplog no M0 | **~4,4 h** |
 | Teto real de escrita (M0) | **~92 ops/s** — acima disso a latência explode |
@@ -129,6 +131,7 @@ Por isso, o que monitorar **não é taxa de erro** — não vai haver erro:
 | Sinal | Alerta |
 |---|---|
 | **Latência de escrita p99** | acima de ~1 s, o cluster está a caminho de perder a liderança |
+| **Concorrência de escrita** | é ela que dói, não o volume: 1 escrita por vez custa ~87 ms; 12 simultâneas custam ~884 ms ([MT-4](../spikes/results/mt-1-2-4-5.md)) |
 | **Atraso do change stream** | acima de alguns segundos, os informers estão obsoletos |
 | Storage usado | o M0 não expande; ao encher, o cluster para |
 

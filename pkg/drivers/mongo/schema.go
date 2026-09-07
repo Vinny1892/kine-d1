@@ -26,9 +26,14 @@ type Record struct {
 	Deleted        bool          `bson:"deleted"`
 	CreateRevision int64         `bson:"create_revision"`
 	PrevRevision   int64         `bson:"prev_revision"`
-	Lease          int64         `bson:"lease"`
-	Value          []byte        `bson:"value,omitempty"`
-	OldValue       []byte        `bson:"old_value,omitempty"`
+	// Version conta as modificações desde a criação da chave: 1 na criação,
+	// 2 no primeiro update, e assim por diante. É a semântica do etcd, e o
+	// apiserver a expõe como metadata.generation em alguns objetos. Volta a 1
+	// quando a chave é recriada depois de apagada.
+	Version  int64  `bson:"version"`
+	Lease    int64  `bson:"lease"`
+	Value    []byte `bson:"value,omitempty"`
+	OldValue []byte `bson:"old_value,omitempty"`
 }
 
 // metaDoc guarda o estado do cluster que precisa sobreviver a reinícios.

@@ -342,6 +342,7 @@ func recordsToEvents(rs []*Record) []*server.Event {
 			e.PrevKV = &server.KeyValue{
 				Key:            r.Name,
 				Value:          r.OldValue,
+				Version:        r.Version - 1,
 				CreateRevision: r.CreateRevision,
 				ModRevision:    r.PrevRevision,
 			}
