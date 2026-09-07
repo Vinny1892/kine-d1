@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/k3s-io/kine/pkg/broadcaster"
 	"github.com/k3s-io/kine/pkg/drivers"
@@ -53,6 +54,10 @@ type Backend struct {
 
 	broadcaster broadcaster.Broadcaster
 	ctx         context.Context
+
+	// streams conta quantos change streams este processo tem abertos. Só o
+	// MW-2 depende disso: o valor deve ser 1 por processo, não 1 por watcher.
+	streams atomic.Int64
 }
 
 func init() {
@@ -237,6 +242,9 @@ func (b *Backend) WaitForSyncTo(revision int64) {
 	}
 	b.mu.RUnlock()
 }
+
+// streamsAbertos devolve quantos change streams este processo mantém.
+func (b *Backend) streamsAbertos() int64 { return b.streams.Load() }
 
 // observeRevision registra uma revisão vista e acorda quem espera por ela.
 func (b *Backend) observeRevision(rev int64) {

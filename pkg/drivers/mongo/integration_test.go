@@ -4,6 +4,7 @@ package mongo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/server"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // Testes de integração contra um MongoDB real. Rodam apenas com a tag
@@ -413,5 +415,168 @@ func TestParseDSN(t *testing.T) {
 	}
 	if _, err := ParseDSN("mongodb://h/?kine_desconhecido=1"); err == nil {
 		t.Error("parâmetro kine_ desconhecido deveria dar erro")
+	}
+}
+
+// TestWatchersCompartilhamUmStream cobre o MW-2: vários watchers precisam
+// dividir um único change stream, não abrir um cada. Um apiserver tem dezenas
+// de informers, e o M0 admite 500 conexões no total.
+func TestWatchersCompartilhamUmStream(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	const nWatchers = 8
+	ctxW, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	res := make([]server.WatchResult, nWatchers)
+	for i := range res {
+		res[i] = b.Watch(ctxW, "/s/", "/s0", 0)
+		if res[i].Events == nil {
+			t.Fatalf("watcher %d não recebeu canal", i)
+		}
+	}
+	time.Sleep(3 * time.Second) // deixa o stream assentar
+
+	// Um único change stream deve estar aberto, independentemente do número
+	// de watchers. O broadcaster chama a ConnectFunc uma vez só.
+	if n := b.streamsAbertos(); n != 1 {
+		t.Errorf("streams abertos = %d, esperado 1 para %d watchers", n, nWatchers)
+	}
+
+	const nChaves = 4
+	for i := 0; i < nChaves; i++ {
+		if _, err := b.Create(ctx, fmt.Sprintf("/s/%d", i), []byte("v"), 0); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	// Todos os watchers precisam ver todos os eventos, em ordem.
+	var wg sync.WaitGroup
+	falhas := make([]string, nWatchers)
+	for i := 0; i < nWatchers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			vistos := 0
+			var ultima int64
+			prazo := time.After(35 * time.Second)
+			for vistos < nChaves {
+				select {
+				case lote, ok := <-res[i].Events:
+					if !ok {
+						falhas[i] = fmt.Sprintf("canal fechou com %d de %d", vistos, nChaves)
+						return
+					}
+					for _, e := range lote {
+						if e.KV.ModRevision <= ultima {
+							falhas[i] = fmt.Sprintf("fora de ordem: %d após %d", e.KV.ModRevision, ultima)
+							return
+						}
+						ultima = e.KV.ModRevision
+						vistos++
+					}
+				case <-prazo:
+					falhas[i] = fmt.Sprintf("timeout com %d de %d eventos", vistos, nChaves)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, f := range falhas {
+		if f != "" {
+			t.Errorf("watcher %d: %s", i, f)
+		}
+	}
+}
+
+// TestRecuperacaoDeStreamInvalidado cobre o MW-3.
+//
+// Ressalva importante sobre o alcance deste teste: ele exercita o mecanismo de
+// recuperação, não o gatilho. Provocar uma invalidação real exigiria encher a
+// janela do oplog, o que não é viável no M0 — isso fica para o MSPIKE-8. O que
+// se prova aqui é que, dada uma lacuna entre a última revisão observada e o
+// estado atual, a leitura direta a preenche na ordem correta e sem repetir.
+func TestRecuperacaoDeStreamInvalidado(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	// Marca o ponto a partir do qual os eventos serão considerados perdidos.
+	if _, err := b.Create(ctx, "/r/marco", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	desde := b.currentRev
+	b.mu.RUnlock()
+
+	const n = 6
+	for i := 0; i < n; i++ {
+		if _, err := b.Create(ctx, fmt.Sprintf("/r/%d", i), []byte("v"), 0); err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+	}
+
+	// Rebobina a revisão observada, simulando um stream que ficou para trás.
+	b.mu.Lock()
+	b.currentRev = desde
+	b.mu.Unlock()
+
+	saida := make(chan server.Events, 64)
+	if ok := b.recuperar(saida); !ok {
+		t.Fatal("recuperar() devolveu false")
+	}
+	close(saida)
+
+	var revs []int64
+	chaves := map[string]bool{}
+	for lote := range saida {
+		for _, e := range lote {
+			revs = append(revs, e.KV.ModRevision)
+			chaves[e.KV.Key] = true
+		}
+	}
+
+	if len(revs) != n {
+		t.Fatalf("recuperou %d eventos, esperado %d", len(revs), n)
+	}
+	for i := 1; i < len(revs); i++ {
+		if revs[i] <= revs[i-1] {
+			t.Errorf("recuperação fora de ordem: %d após %d", revs[i], revs[i-1])
+		}
+	}
+	for i := 0; i < n; i++ {
+		if !chaves[fmt.Sprintf("/r/%d", i)] {
+			t.Errorf("chave /r/%d não foi recuperada", i)
+		}
+	}
+	// A revisão observada precisa ter avançado, senão a próxima recuperação
+	// repetiria os mesmos eventos.
+	b.mu.RLock()
+	depois := b.currentRev
+	b.mu.RUnlock()
+	if depois <= desde {
+		t.Errorf("currentRev não avançou após a recuperação: %d -> %d", desde, depois)
+	}
+}
+
+// TestHistoricoPerdido garante que só os códigos de invalidação disparam a
+// recuperação — um erro de rede comum deve apenas reconectar pelo token.
+func TestHistoricoPerdido(t *testing.T) {
+	casos := []struct {
+		nome     string
+		err      error
+		esperado bool
+	}{
+		{"nil", nil, false},
+		{"erro comum", errors.New("connection reset"), false},
+		{"ChangeStreamHistoryLost", mongo.CommandError{Code: errChangeStreamHistoryLost}, true},
+		{"ChangeStreamFatalError", mongo.CommandError{Code: errChangeStreamFatalError}, true},
+		{"outro código", mongo.CommandError{Code: 11000}, false},
+	}
+	for _, c := range casos {
+		if got := historicoPerdido(c.err); got != c.esperado {
+			t.Errorf("%s: historicoPerdido=%v, esperado %v", c.nome, got, c.esperado)
+		}
 	}
 }

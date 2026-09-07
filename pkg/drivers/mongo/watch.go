@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
@@ -21,6 +22,18 @@ import (
 // ordem em que o oplog entrega os eventos é a ordem das revisões. Medido no
 // MSPIKE-4: zero eventos fora de ordem em 40, contra 13 de 29 quando a
 // revisão vinha de um contador.
+//
+// Existe UM único change stream por processo, compartilhado por todos os
+// watchers através do pkg/broadcaster (MW-2). Antes cada Watch abria o seu, o
+// que multiplicava conexões — um apiserver tem dezenas de informers, e o M0
+// admite 500 conexões no total.
+
+// Códigos de erro do MongoDB que significam "o stream não pode ser retomado
+// de onde parou". Ver MW-3.
+const (
+	errChangeStreamHistoryLost = 286
+	errChangeStreamFatalError  = 280
+)
 
 // Watch entrega os eventos de um range a partir de uma revisão.
 func (b *Backend) Watch(ctx context.Context, key, end string, revision int64) server.WatchResult {
@@ -43,7 +56,20 @@ func (b *Backend) Watch(ctx context.Context, key, end string, revision int64) se
 		return server.WatchResult{CurrentRevision: rev, CompactRevision: compact, Errorc: errc}
 	}
 
-	go b.watchLoop(ctx, key, end, revision, eventos, errc)
+	// A inscrição acontece ANTES de buscar o histórico. A ordem importa: se
+	// fosse o contrário, um evento que ocorresse entre o fim da leitura
+	// histórica e a inscrição se perderia. Inscrito primeiro, o que chegar
+	// nesse intervalo fica no buffer do canal e é filtrado depois pela
+	// revisão de corte.
+	ao_vivo, err := b.broadcaster.Subscribe(ctx, b.conectarStream)
+	if err != nil {
+		errc <- fmt.Errorf("assinar o change stream: %w", err)
+		close(eventos)
+		close(errc)
+		return server.WatchResult{CurrentRevision: rev, CompactRevision: compact, Errorc: errc}
+	}
+
+	go b.repassar(ctx, key, end, revision, ao_vivo, eventos, errc)
 
 	return server.WatchResult{
 		CurrentRevision: rev,
@@ -53,15 +79,14 @@ func (b *Backend) Watch(ctx context.Context, key, end string, revision int64) se
 	}
 }
 
-func (b *Backend) watchLoop(ctx context.Context, key, end string, revision int64,
-	eventos chan []*server.Event, errc chan error) {
+// repassar entrega primeiro o histórico pedido e depois filtra o fluxo ao vivo
+// para o range deste watcher.
+func (b *Backend) repassar(ctx context.Context, key, end string, revision int64,
+	ao_vivo <-chan server.Events, eventos chan []*server.Event, errc chan error) {
 
 	defer close(eventos)
 	defer close(errc)
 
-	// 1) Recuperação histórica: tudo que aconteceu entre a revisão pedida e
-	//    agora precisa ser entregue antes de ligar o stream ao vivo. Sem isso,
-	//    um watcher que reconecta perde a janela.
 	corte := revision
 	if corte > 0 {
 		antigos, err := b.after(ctx, key, end, corte, 0)
@@ -82,9 +107,170 @@ func (b *Backend) watchLoop(ctx context.Context, key, end string, revision int64
 		corte = atual
 	}
 
-	// 2) Stream ao vivo, retomado a partir do clusterTime correspondente à
-	//    última revisão já entregue — assim a emenda com o histórico não tem
-	//    buraco nem duplicata.
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case lote, ok := <-ao_vivo:
+			if !ok {
+				return
+			}
+			var meus []*server.Event
+			for _, e := range lote {
+				if e.KV == nil || e.KV.ModRevision <= corte {
+					continue // já coberto pela fase histórica
+				}
+				if !inRange(e.KV.Key, key, end) {
+					continue
+				}
+				corte = e.KV.ModRevision
+				meus = append(meus, e)
+			}
+			if len(meus) > 0 {
+				select {
+				case eventos <- meus:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+// conectarStream é a ConnectFunc do broadcaster: chamada uma única vez, na
+// primeira inscrição. Devolve o canal que o loop do stream alimenta.
+func (b *Backend) conectarStream() (chan server.Events, error) {
+	saida := make(chan server.Events, 100)
+	go b.laçoDoStream(saida)
+	return saida, nil
+}
+
+// laçoDoStream mantém um change stream vivo, reabrindo-o quando cai.
+//
+// MW-3: um stream que fica para trás da janela do oplog é invalidado, e o
+// MongoDB recusa retomá-lo pelo resume token. Quando isso acontece, o buraco é
+// preenchido lendo a coleção diretamente entre a última revisão entregue e
+// agora, e só então um stream novo é aberto. Sem isso o watch morreria em
+// silêncio — e no M0 o oplog é pequeno e não configurável, então basta o kine
+// ficar alguns minutos lento para cair nesse caso.
+func (b *Backend) laçoDoStream(saida chan server.Events) {
+	defer close(saida)
+
+	var token bson.Raw
+	espera := time.Second
+
+	for {
+		if b.ctx.Err() != nil {
+			return
+		}
+
+		cs, err := b.abrirStream(token)
+		if err != nil {
+			if b.ctx.Err() != nil {
+				return
+			}
+			logrus.Errorf("Falha ao abrir o change stream: %v", err)
+			if !b.dormir(espera) {
+				return
+			}
+			espera = min(espera*2, 30*time.Second)
+			continue
+		}
+		espera = time.Second
+
+		b.streams.Add(1)
+		token = b.consumir(cs, saida, token)
+		b.streams.Add(-1)
+		cs.Close(context.Background())
+	}
+}
+
+// consumir lê o stream até ele cair, devolvendo o resume token mais recente.
+func (b *Backend) consumir(cs *mongo.ChangeStream, saida chan server.Events, token bson.Raw) bson.Raw {
+	for cs.Next(b.ctx) {
+		var ev struct {
+			ClusterTime  bson.Timestamp `bson:"clusterTime"`
+			FullDocument *Record        `bson:"fullDocument"`
+		}
+		if err := cs.Decode(&ev); err != nil {
+			logrus.Errorf("Falha ao decodificar evento do change stream: %v", err)
+			continue
+		}
+		token = cs.ResumeToken()
+
+		r := ev.FullDocument
+		if r == nil {
+			continue
+		}
+		// A revisão vem do clusterTime do evento, não do campo `rev` do
+		// documento. São o mesmo valor — o clusterTime do insert é o que a
+		// escrita grava —, mas o do evento já está disponível aqui e chega na
+		// ordem do oplog, enquanto o campo depende de um update posterior.
+		rev, err := EncodeRevision(ev.ClusterTime, b.cfg.EpochBase)
+		if err != nil {
+			logrus.Errorf("clusterTime inválido no change stream: %v", err)
+			continue
+		}
+		r.Rev = rev
+		if r.Created {
+			r.CreateRevision = rev
+		}
+		b.observeRevision(rev)
+
+		select {
+		case saida <- recordsToEvents([]*Record{r}):
+		case <-b.ctx.Done():
+			return token
+		}
+	}
+
+	err := cs.Err()
+	if err == nil || errors.Is(err, context.Canceled) {
+		return token
+	}
+
+	if historicoPerdido(err) {
+		logrus.Warnf("Change stream invalidado (%v): recuperando por leitura direta", err)
+		if b.recuperar(saida) {
+			return nil // recomeça sem token: a janela já foi coberta
+		}
+	}
+	logrus.Errorf("Change stream caiu: %v", err)
+	return token
+}
+
+// recuperar preenche o intervalo perdido lendo a coleção diretamente, da última
+// revisão observada até o fim. Devolve false se não conseguiu.
+func (b *Backend) recuperar(saida chan server.Events) bool {
+	b.mu.RLock()
+	desde := b.currentRev
+	b.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(b.ctx, 2*time.Minute)
+	defer cancel()
+
+	perdidos, err := b.after(ctx, "", "", desde, 0)
+	if err != nil {
+		logrus.Errorf("Falha ao recuperar o intervalo perdido do watch: %v", err)
+		return false
+	}
+	if len(perdidos) == 0 {
+		return true
+	}
+	logrus.Infof("Recuperados %d eventos perdidos pela invalidação do change stream", len(perdidos))
+	for _, r := range perdidos {
+		b.observeRevision(r.Rev)
+		select {
+		case saida <- recordsToEvents([]*Record{r}):
+		case <-b.ctx.Done():
+			return false
+		}
+	}
+	return true
+}
+
+// abrirStream abre o change stream, retomando pelo token quando houver.
+func (b *Backend) abrirStream(token bson.Raw) (*mongo.ChangeStream, error) {
 	// Só inserts interessam. O kine é um log append-only: toda mutação — criar,
 	// atualizar, apagar — insere um documento novo. O único update que existe é
 	// o que grava o campo `rev` logo depois do insert (ver crud.go), e ele não
@@ -100,59 +286,37 @@ func (b *Backend) watchLoop(ctx context.Context, key, end string, revision int64
 	}
 
 	opts := options.ChangeStream()
-	if corte > 0 {
-		ts := DecodeRevision(corte, b.cfg.EpochBase)
-		opts.SetStartAtOperationTime(&ts)
+	if len(token) > 0 {
+		opts.SetResumeAfter(token)
+	} else {
+		b.mu.RLock()
+		rev := b.currentRev
+		b.mu.RUnlock()
+		if rev > 0 {
+			ts := DecodeRevision(rev, b.cfg.EpochBase)
+			opts.SetStartAtOperationTime(&ts)
+		}
 	}
+	return b.col.Watch(b.ctx, pipeline, opts)
+}
 
-	cs, err := b.col.Watch(ctx, pipeline, opts)
-	if err != nil {
-		errc <- fmt.Errorf("abrir change stream: %w", err)
-		return
+// historicoPerdido diz se o erro significa que o oplog já não cobre o ponto de
+// retomada — o caso que exige recuperação por leitura direta.
+func historicoPerdido(err error) bool {
+	var ce mongo.ServerError
+	if errors.As(err, &ce) {
+		return ce.HasErrorCode(errChangeStreamHistoryLost) ||
+			ce.HasErrorCode(errChangeStreamFatalError)
 	}
-	defer cs.Close(context.Background())
+	return false
+}
 
-	for cs.Next(ctx) {
-		var ev struct {
-			ClusterTime  bson.Timestamp `bson:"clusterTime"`
-			FullDocument *Record        `bson:"fullDocument"`
-		}
-		if err := cs.Decode(&ev); err != nil {
-			logrus.Errorf("Falha ao decodificar evento do change stream: %v", err)
-			continue
-		}
-		r := ev.FullDocument
-		if r == nil {
-			continue
-		}
-		// A revisão vem do clusterTime do evento, não do campo `rev` do
-		// documento. São o mesmo valor — o clusterTime do insert é o que a
-		// escrita gravou —, mas o do evento já está disponível aqui e chega na
-		// ordem do oplog, enquanto o campo depende de um update posterior.
-		rev, err := EncodeRevision(ev.ClusterTime, b.cfg.EpochBase)
-		if err != nil {
-			logrus.Errorf("clusterTime inválido no change stream: %v", err)
-			continue
-		}
-		r.Rev = rev
-		if r.Created {
-			r.CreateRevision = rev
-		}
-		if rev <= corte {
-			continue // já entregue na fase histórica
-		}
-		if !inRange(r.Name, key, end) {
-			b.observeRevision(rev)
-			continue
-		}
-		corte = rev
-		b.observeRevision(rev)
-		eventos <- recordsToEvents([]*Record{r})
-	}
-
-	if err := cs.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		logrus.Errorf("Change stream encerrado com erro: %v", err)
-		errc <- err
+func (b *Backend) dormir(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-b.ctx.Done():
+		return false
 	}
 }
 
