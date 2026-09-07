@@ -169,6 +169,7 @@ func (b *Backend) laçoDoStream(saida chan server.Events) {
 			if b.ctx.Err() != nil {
 				return
 			}
+			ChangeStreamReconnects.WithLabelValues("falha_ao_abrir").Inc()
 			logrus.Errorf("Falha ao abrir o change stream: %v", err)
 			if !b.dormir(espera) {
 				return
@@ -230,11 +231,13 @@ func (b *Backend) consumir(cs *mongo.ChangeStream, saida chan server.Events, tok
 	}
 
 	if historicoPerdido(err) {
+		ChangeStreamReconnects.WithLabelValues("historico_perdido").Inc()
 		logrus.Warnf("Change stream invalidado (%v): recuperando por leitura direta", err)
 		if b.recuperar(saida) {
 			return nil // recomeça sem token: a janela já foi coberta
 		}
 	}
+	ChangeStreamReconnects.WithLabelValues("queda").Inc()
 	logrus.Errorf("Change stream caiu: %v", err)
 	return token
 }

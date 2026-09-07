@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
@@ -23,7 +24,10 @@ import (
 // para o List, que filtram por rev. Um documento órfão assim é inerte, não
 // corrompe nada, e a chave pode ser reescrita porque a constraint
 // (name, prev_revision) continua valendo.
-func (b *Backend) append(ctx context.Context, r *Record) (int64, error) {
+func (b *Backend) append(ctx context.Context, r *Record) (rev int64, err error) {
+	inicio := time.Now()
+	defer func() { observar("append", inicio, err) }()
+
 	sess, err := b.client.StartSession()
 	if err != nil {
 		return 0, fmt.Errorf("abrir sessão: %w", err)
@@ -41,7 +45,7 @@ func (b *Backend) append(ctx context.Context, r *Record) (int64, error) {
 	if ts == nil {
 		return 0, fmt.Errorf("MongoDB não devolveu operationTime: impossível derivar a revisão")
 	}
-	rev, err := EncodeRevision(*ts, b.cfg.EpochBase)
+	rev, err = EncodeRevision(*ts, b.cfg.EpochBase)
 	if err != nil {
 		return 0, err
 	}

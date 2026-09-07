@@ -1,0 +1,113 @@
+name: mongo
+
+# CI do backend MongoDB. Roda contra um MongoDB de verdade em replica set —
+# não há como testar este driver sem isso: Change Streams e transações exigem
+# replica set, e são a base do desenho (ver docs/adr/).
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'pkg/drivers/mongo/**'
+      - 'test/mongo/**'
+      - 'pkg/endpoint/init.go'
+      - '.github/workflows/mongo.yml'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - 'pkg/drivers/mongo/**'
+      - 'test/mongo/**'
+      - 'pkg/endpoint/init.go'
+      - '.github/workflows/mongo.yml'
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          arquivos=$(gofmt -l pkg/drivers/mongo test/mongo)
+          if [ -n "$arquivos" ]; then
+            echo "não formatados:"; echo "$arquivos"; exit 1
+          fi
+      - name: go vet
+        # test/mongo só tem arquivos com a tag de integração, então sem ela o
+        # pacote fica vazio e o vet reclama
+        run: go vet ./pkg/drivers/mongo/...
+      - name: go vet (com a tag de integração)
+        run: go vet -tags=integration ./pkg/drivers/mongo/... ./test/mongo/...
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build multi-arch
+        run: |
+          for alvo in linux/amd64 linux/arm64; do
+            GOOS=${alvo%/*} GOARCH=${alvo#*/} CGO_ENABLED=0 \
+              go build -o /tmp/kine-${alvo#*/} .
+            echo "✓ $alvo"
+          done
+      - name: os outros drivers continuam compilando
+        run: go build ./...
+
+  testes:
+    runs-on: ubuntu-latest
+    services:
+      # replica set de um nó: suficiente para Change Streams e transações,
+      # que é o que o driver precisa. Um standalone não serve.
+      mongo:
+        image: mongo:8
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok'"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: iniciar o replica set
+        run: |
+          # A imagem oficial não sobe como replica set por padrão. Reiniciamos
+          # o container com --replSet e damos rs.initiate().
+          docker stop "${{ job.services.mongo.id }}"
+          docker run -d --name mongo-rs -p 27017:27017 mongo:8 \
+            mongod --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongo-rs mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec mongo-rs mongosh --quiet --eval '
+            rs.initiate({_id:"rs0", members:[{_id:0, host:"localhost:27017"}]})'
+          # espera o nó virar primary, senão as escritas falham
+          for i in $(seq 1 30); do
+            if docker exec mongo-rs mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; then
+              echo "replica set pronto"; break
+            fi
+            sleep 2
+          done
+
+      - name: ferramentas de backup (para o teste do runbook)
+        run: |
+          curl -sL https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.13.0.tgz \
+            | tar xz --strip-components=2 -C /usr/local/bin \
+              --wildcards '*/bin/mongodump' '*/bin/mongorestore'
+          mongodump --version | head -1
+
+      - name: testes unitários
+        run: go test ./...
+
+      - name: testes de integração
+        env:
+          KINE_MONGO_TEST_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+        run: go test -tags=integration -timeout 20m ./pkg/drivers/mongo/... ./test/mongo/...

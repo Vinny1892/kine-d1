@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/broadcaster"
 	"github.com/k3s-io/kine/pkg/drivers"
@@ -48,6 +49,11 @@ type Backend struct {
 	mu         sync.RWMutex
 	currentRev int64
 	compactRev int64
+	// ultimoEvento é quando o change stream entregou algo pela última vez.
+	// Alimenta o kine_mongo_change_stream_lag_seconds, que é a métrica que
+	// detecta o modo de falha mais provável: sob saturação o Atlas não devolve
+	// erro, só atrasa (MSPIKE-6).
+	ultimoEvento time.Time
 
 	// notify acorda quem espera por WaitForSyncTo.
 	synced *sync.Cond
@@ -113,6 +119,8 @@ func New(ctx context.Context, wg *sync.WaitGroup, drvCfg *drivers.Config) (bool,
 	}
 	b.synced = sync.NewCond(b.mu.RLocker())
 
+	registrarMetricas(drvCfg.MetricsRegisterer)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -158,7 +166,52 @@ func (b *Backend) Start(ctx context.Context) error {
 
 	logrus.Infof("MongoDB iniciado: revisão atual=%d, revisão compactada=%d", rev, cr)
 	go ttl.Run(ctx, b)
+	go b.coletarGauges(ctx)
 	return nil
+}
+
+// coletarGauges atualiza periodicamente as métricas que não vêm de operações:
+// revisões, uso de storage e atraso do change stream.
+//
+// O intervalo é longo de propósito. Um collStats a cada poucos segundos
+// consumiria parte do orçamento de operações do M0 — e o que se está medindo é
+// justamente a saturação desse orçamento.
+func (b *Backend) coletarGauges(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		b.mu.RLock()
+		rev, comp := b.currentRev, b.compactRev
+		ultimo := b.ultimoEvento
+		b.mu.RUnlock()
+
+		CurrentRevisionGauge.Set(float64(rev))
+		CompactedRevisionGauge.Set(float64(comp))
+		if !ultimo.IsZero() {
+			ChangeStreamLag.Set(time.Since(ultimo).Seconds())
+		}
+
+		var stats struct {
+			StorageSize    int64 `bson:"storageSize"`
+			TotalIndexSize int64 `bson:"totalIndexSize"`
+			Size           int64 `bson:"size"`
+		}
+		err := b.client.Database(b.cfg.Database).
+			RunCommand(ctx, bson.D{{Key: "collStats", Value: b.cfg.Collection}}).
+			Decode(&stats)
+		if err != nil {
+			continue
+		}
+		StorageBytes.WithLabelValues("dados").Set(float64(stats.Size))
+		StorageBytes.WithLabelValues("storage").Set(float64(stats.StorageSize))
+		StorageBytes.WithLabelValues("indices").Set(float64(stats.TotalIndexSize))
+	}
 }
 
 func (b *Backend) ensureCompactKey(ctx context.Context) error {
@@ -252,6 +305,7 @@ func (b *Backend) observeRevision(rev int64) {
 	if rev > b.currentRev {
 		b.currentRev = rev
 	}
+	b.ultimoEvento = time.Now()
 	b.mu.Unlock()
 	b.synced.Broadcast()
 }

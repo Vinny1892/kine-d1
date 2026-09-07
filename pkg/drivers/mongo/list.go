@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -55,7 +56,14 @@ func currentPipeline(key, end string, revision, limit int64, includeDeleted, key
 }
 
 // List devolve o estado corrente das chaves de um range.
-func (b *Backend) List(ctx context.Context, key, end string, limit, revision int64, keysOnly bool) (int64, []*server.KeyValue, error) {
+func (b *Backend) List(ctx context.Context, key, end string, limit, revision int64, keysOnly bool) (_ int64, _ []*server.KeyValue, err error) {
+	inicio := time.Now()
+	op := "list"
+	if keysOnly {
+		op = "list_keysonly"
+	}
+	defer func() { observar(op, inicio, err) }()
+
 	rev, err := b.CurrentRevision(ctx)
 	if err != nil {
 		return 0, nil, err
@@ -88,7 +96,10 @@ func (b *Backend) List(ctx context.Context, key, end string, limit, revision int
 }
 
 // Count devolve quantas chaves existem no range.
-func (b *Backend) Count(ctx context.Context, key, end string, revision int64) (int64, int64, error) {
+func (b *Backend) Count(ctx context.Context, key, end string, revision int64) (_ int64, _ int64, err error) {
+	inicio := time.Now()
+	defer func() { observar("count", inicio, err) }()
+
 	rev, err := b.CurrentRevision(ctx)
 	if err != nil {
 		return 0, 0, err

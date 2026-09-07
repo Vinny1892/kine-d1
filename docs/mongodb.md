@@ -135,6 +135,17 @@ Por isso, o que monitorar **não é taxa de erro** — não vai haver erro:
 | **Atraso do change stream** | acima de alguns segundos, os informers estão obsoletos |
 | Storage usado | o M0 não expande; ao encher, o cluster para |
 
+As métricas expostas pelo driver, todas com prefixo `kine_mongo_`:
+
+| Métrica | |
+|---|---|
+| `ops_total{op,result}` | contagem por operação |
+| `op_duration_seconds{op}` | histograma, buckets de 1 ms a ~16 s |
+| **`change_stream_lag_seconds`** | idade do último evento — **a que detecta o modo de falha real** |
+| `change_stream_reconnects_total{motivo}` | `queda`, `historico_perdido`, `falha_ao_abrir` |
+| `storage_bytes{componente}` | `dados`, `storage`, `indices` |
+| `current_revision`, `compacted_revision` | posição do log |
+
 ## Quando não usar
 
 Seja honesto sobre o que isso é.
@@ -144,7 +155,7 @@ Seja honesto sobre o que isso é.
 - **É produção crítica.** Este driver é novo, não tem uso em campo, e não passou pela suíte de conformidade etcd completa (`MT-2`).
 - **O cluster tem muito churn** — CI criando milhares de Jobs, operadores com reconcile agressivo. O teto é ~30 mutações/s antes da latência machucar a leader election ([MSPIKE-6](../spikes/results/mspike-6.md)), e o sintoma de estourar é o cluster travando sem mensagem de erro.
 - **A latência importa.** Cada operação do apiserver paga a ida e volta até o MongoDB. Com o banco longe, isso vira dezenas ou centenas de milissegundos, e a leader election tem deadlines de 5-10 s.
-- **Você precisa de backup automático no M0.** O free tier não tem; só `mongodump` manual.
+- **Você precisa de backup automático no M0.** O free tier não tem; só `mongodump` manual — runbook em [backup-restore.md](backup-restore.md).
 - **Não pode usar replica set.** Standalone não serve.
 
 **Faz sentido para:** homelab, borda, dev/staging, clusters pequenos onde "não administrar banco" vale mais que milissegundos, e onde o Atlas já é parte da stack.
@@ -183,5 +194,7 @@ Os testes de integração criam uma coleção própria por execução e a remove
 | `hack/k3s-diag.sh` | Sobe só o k3s contra um kine já em execução, sem matar nada no fim |
 | `hack/k3s-limpar.sh` | Derruba tudo do k3s, inclusive instâncias órfãs |
 | `spikes/*.py` | As medições, reproduzíveis |
+
+Backup e restore: [docs/backup-restore.md](backup-restore.md) — o M0 não tem backup automático.
 
 **Não tente no WSL2.** O `modprobe iptable_nat` trava em estado `D` (uninterruptible) dentro do kernel do WSL, imune a `kill -9`. Como o carregamento de módulos é serializado, todo `modprobe` seguinte fica preso atrás dele e o k3s espera para sempre — sem gerar erro no log. Use `hack/ec2-mt3.sh` ou uma VM.

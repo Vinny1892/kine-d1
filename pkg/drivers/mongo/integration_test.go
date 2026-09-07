@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -837,6 +840,171 @@ func TestDuasInstancias(t *testing.T) {
 			if kv == nil {
 				t.Errorf("instância %s não vê %s após a compactação", nome, k)
 			}
+		}
+	}
+}
+
+// TestMetricasExpostas cobre o MOPS-1: as métricas precisam existir e ser
+// alimentadas pelas operações reais.
+//
+// O alvo destas métricas vem do MSPIKE-6: sob saturação o Atlas não devolve
+// erro, só atrasa. Então taxa de erro não detecta o problema — latência de
+// escrita e atraso do change stream detectam.
+func TestMetricasExpostas(t *testing.T) {
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	reg := prometheus.NewRegistry()
+	registrarMetricas(reg)
+
+	if _, err := b.Create(ctx, "/m/a", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.List(ctx, "/m/", "/m0", 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.Count(ctx, "/m/", "/m0", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	vistas := map[string]bool{}
+	for _, f := range fams {
+		vistas[f.GetName()] = true
+	}
+
+	essenciais := []string{
+		"kine_mongo_ops_total",
+		"kine_mongo_op_duration_seconds",
+		// as duas que detectam o modo de falha real
+		"kine_mongo_change_stream_lag_seconds",
+		"kine_mongo_change_stream_reconnects_total",
+		"kine_mongo_storage_bytes",
+		"kine_mongo_current_revision",
+		"kine_mongo_compacted_revision",
+	}
+	for _, nome := range essenciais {
+		if !vistas[nome] {
+			t.Errorf("métrica %s não registrada", nome)
+		}
+	}
+
+	// As operações precisam ter alimentado os contadores.
+	achou := map[string]bool{}
+	for _, f := range fams {
+		if f.GetName() != "kine_mongo_ops_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var op, res string
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "op":
+					op = l.GetValue()
+				case "result":
+					res = l.GetValue()
+				}
+			}
+			if res == "success" && m.GetCounter().GetValue() > 0 {
+				achou[op] = true
+			}
+		}
+	}
+	for _, op := range []string{"append", "list", "count"} {
+		if !achou[op] {
+			t.Errorf("kine_mongo_ops_total sem sucesso registrado para op=%q", op)
+		}
+	}
+}
+
+// TestBackupRestore cobre o MOPS-4: o runbook de docs/backup-restore.md
+// precisa funcionar de verdade, incluindo a parte que é fácil errar — o
+// kine_meta, que carrega o epoch base.
+func TestBackupRestore(t *testing.T) {
+	if _, err := exec.LookPath("mongodump"); err != nil {
+		t.Skip("mongodump não está no PATH")
+	}
+	if _, err := exec.LookPath("mongorestore"); err != nil {
+		t.Skip("mongorestore não está no PATH")
+	}
+	uri := os.Getenv("KINE_MONGO_TEST_URI")
+	if uri == "" {
+		t.Skip("KINE_MONGO_TEST_URI não definida")
+	}
+
+	b, ctx, limpar := testBackend(t)
+	defer limpar()
+
+	// Estado a preservar.
+	chaves := map[string]string{}
+	for i := 0; i < 5; i++ {
+		k := fmt.Sprintf("/backup/k%d", i)
+		v := fmt.Sprintf("valor-%d", i)
+		if _, err := b.Create(ctx, k, []byte(v), 0); err != nil {
+			t.Fatal(err)
+		}
+		chaves[k] = v
+	}
+	epochOriginal := b.cfg.EpochBase
+	dbNome := b.cfg.Database
+	colNome := b.cfg.Collection
+
+	dir := t.TempDir()
+	dump := exec.CommandContext(ctx, "mongodump", "--uri="+uri, "--db="+dbNome, "--out="+dir)
+	if saida, err := dump.CombinedOutput(); err != nil {
+		t.Fatalf("mongodump: %v\n%s", err, saida)
+	}
+
+	// As duas coleções precisam estar no dump — esquecer o _meta é o erro
+	// clássico, e ele carrega o epoch base.
+	for _, esperado := range []string{colNome + ".bson", colNome + "_meta.bson"} {
+		if _, err := os.Stat(filepath.Join(dir, dbNome, esperado)); err != nil {
+			t.Errorf("o dump não contém %s: %v", esperado, err)
+		}
+	}
+
+	// Simula a perda: apaga tudo.
+	if err := b.col.Drop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.meta.Drop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := b.col.CountDocuments(ctx, bson.M{}); n != 0 {
+		t.Fatalf("a coleção não foi apagada: %d documentos", n)
+	}
+
+	rest := exec.CommandContext(ctx, "mongorestore", "--uri="+uri, "--drop",
+		"--db="+dbNome, filepath.Join(dir, dbNome))
+	if saida, err := rest.CombinedOutput(); err != nil {
+		t.Fatalf("mongorestore: %v\n%s", err, saida)
+	}
+
+	// O epoch base precisa voltar idêntico, senão as revisões passam a
+	// significar outro instante.
+	var meta metaDoc
+	if err := b.meta.FindOne(ctx, bson.M{"_id": metaID}).Decode(&meta); err != nil {
+		t.Fatalf("kine_meta não voltou: %v", err)
+	}
+	if meta.EpochBase != epochOriginal {
+		t.Errorf("epoch base after restore = %d, esperado %d", meta.EpochBase, epochOriginal)
+	}
+
+	// E as chaves precisam estar todas lá, com os valores certos.
+	for k, v := range chaves {
+		_, kv, err := b.Get(ctx, k, 0, false)
+		if err != nil {
+			t.Fatalf("Get %s: %v", k, err)
+		}
+		if kv == nil {
+			t.Errorf("%s não voltou do backup", k)
+			continue
+		}
+		if string(kv.Value) != v {
+			t.Errorf("%s = %q, esperado %q", k, kv.Value, v)
 		}
 	}
 }
